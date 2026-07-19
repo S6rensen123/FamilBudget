@@ -25,6 +25,7 @@ create table if not exists public.users (
 create table if not exists public.sessions (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references public.users(id) on delete cascade,
+  token text unique,
   device_name text,
   platform text,
   refresh_token_hash text,
@@ -99,8 +100,32 @@ create table if not exists public.notifications (
   created_at timestamptz not null default now()
 );
 
+alter table if exists public.users
+  add column if not exists updated_at timestamptz not null default now();
+
+alter table if exists public.sessions
+  add column if not exists token text,
+  add column if not exists device_name text,
+  add column if not exists platform text,
+  add column if not exists refresh_token_hash text,
+  add column if not exists revoked_at timestamptz;
+
+alter table if exists public.households
+  add column if not exists updated_at timestamptz not null default now();
+
+alter table if exists public.transactions
+  add column if not exists note text,
+  add column if not exists updated_at timestamptz not null default now();
+
+alter table if exists public.subscriptions
+  add column if not exists updated_at timestamptz not null default now();
+
+alter table if exists public.savings_goals
+  add column if not exists updated_at timestamptz not null default now();
+
 create index if not exists idx_users_email on public.users(email);
 create index if not exists idx_sessions_user_expires on public.sessions(user_id, expires_at desc);
+create unique index if not exists idx_sessions_token on public.sessions(token) where token is not null;
 create index if not exists idx_households_owner on public.households(owner_id);
 create index if not exists idx_household_members_household on public.household_members(household_id);
 create index if not exists idx_household_members_user on public.household_members(user_id);

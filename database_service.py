@@ -220,6 +220,7 @@ class SupabaseRestSyncTransport:
 class DatabaseService:
     SYNC_PRIORITY = {
         "users": 10,
+        "sessions": 15,
         "households": 20,
         "household_members": 30,
         "transactions": 40,
@@ -227,22 +228,34 @@ class DatabaseService:
         "savings_goals": 60,
         "notifications": 70,
     }
-    SUPABASE_ALLOWED_COLUMNS = {
-        "users": {"full_name", "email", "password_hash", "created_at", "role", "avatar_url"},
-        "households": {"name", "owner_id", "invite_code", "created_at"},
-        "household_members": {"household_id", "user_id", "role", "created_at"},
-        "transactions": {"user_id", "household_id", "dato", "kategori", "beloeb", "type", "note", "created_at"},
-        "notifications": {"user_id", "household_id", "title", "message", "kind", "read", "created_at"},
-        "subscriptions": {"user_id", "household_id", "name", "amount", "billing_date", "active", "created_at"},
-        "savings_goals": {"user_id", "household_id", "title", "target_amount", "current_amount", "due_date", "created_at"},
-    }
-    SUPABASE_FOREIGN_KEYS = {
+    UUID_TABLES = (
+        "users",
+        "sessions",
+        "households",
+        "household_members",
+        "transactions",
+        "subscriptions",
+        "savings_goals",
+        "notifications",
+    )
+    UUID_FOREIGN_KEYS = {
+        "sessions": {"user_id": "users"},
         "households": {"owner_id": "users"},
         "household_members": {"household_id": "households", "user_id": "users"},
         "transactions": {"user_id": "users", "household_id": "households"},
         "notifications": {"user_id": "users", "household_id": "households"},
         "subscriptions": {"user_id": "users", "household_id": "households"},
         "savings_goals": {"user_id": "users", "household_id": "households"},
+    }
+    SUPABASE_ALLOWED_COLUMNS = {
+        "users": {"id", "full_name", "email", "password_hash", "created_at", "last_login", "role", "avatar_url", "updated_at"},
+        "sessions": {"id", "user_id", "token", "device_name", "platform", "refresh_token_hash", "created_at", "expires_at", "revoked_at"},
+        "households": {"id", "name", "owner_id", "invite_code", "created_at", "updated_at"},
+        "household_members": {"id", "household_id", "user_id", "role", "created_at"},
+        "transactions": {"id", "user_id", "household_id", "dato", "kategori", "beloeb", "type", "note", "created_at", "updated_at"},
+        "notifications": {"id", "user_id", "household_id", "title", "message", "kind", "read", "created_at"},
+        "subscriptions": {"id", "user_id", "household_id", "name", "amount", "billing_date", "active", "created_at", "updated_at"},
+        "savings_goals": {"id", "user_id", "household_id", "title", "target_amount", "current_amount", "due_date", "created_at", "updated_at"},
     }
 
     def __init__(
@@ -288,6 +301,13 @@ class DatabaseService:
         print("[DB] Sync transport enabled:", self._sync_transport is not None)
 
         self.init_db()
+        print("[SYNC] UUID mode enabled")
+
+    def _now(self) -> str:
+        return datetime.now().isoformat(sep=" ", timespec="seconds")
+
+    def _new_uuid(self) -> str:
+        return str(uuid.uuid4())
 
     def _ensure_column(self, table: str, column_name: str, definition: str) -> None:
         if self.provider.has_column(table, column_name):
@@ -295,114 +315,155 @@ class DatabaseService:
         self.provider.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
         self.provider.commit()
 
-    def _now(self) -> str:
-        return datetime.now().isoformat(sep=" ", timespec="seconds")
+    def _column_type(self, table: str, column_name: str) -> str:
+        if not self.provider.table_exists(table):
+            return ""
+        self.provider.execute(f"PRAGMA table_info({table})")
+        for row in self.provider.fetchall():
+            if row["name"] == column_name:
+                return str(row["type"]).upper()
+        return ""
 
-    def init_db(self) -> None:
-        self.provider.execute("PRAGMA foreign_keys = ON")
+    def _table_columns(self, table: str) -> List[str]:
+        if not self.provider.table_exists(table):
+            return []
+        self.provider.execute(f"PRAGMA table_info({table})")
+        return [str(row["name"]) for row in self.provider.fetchall()]
 
+    def _needs_uuid_migration(self) -> bool:
+        if not isinstance(self.provider, SQLiteProvider):
+            return False
+        for table_name in self.UUID_TABLES:
+            column_type = self._column_type(table_name, "id")
+            if column_type and "TEXT" not in column_type:
+                return True
+        sync_row_id_type = self._column_type("sync_queue", "row_id")
+        return bool(sync_row_id_type and "TEXT" not in sync_row_id_type)
+
+    def _create_uuid_schema(self, suffix: str = "") -> None:
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            f"""
+            CREATE TABLE IF NOT EXISTS users{suffix} (
+                id TEXT PRIMARY KEY,
                 full_name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_login TEXT,
                 role TEXT NOT NULL DEFAULT 'user',
-                avatar_url TEXT
+                avatar_url TEXT,
+                updated_at TEXT NOT NULL
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+            f"""
+            CREATE TABLE IF NOT EXISTS sessions{suffix} (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
                 token TEXT NOT NULL UNIQUE,
+                device_name TEXT,
+                platform TEXT,
+                refresh_token_hash TEXT,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                revoked_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE CASCADE
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS households (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            f"""
+            CREATE TABLE IF NOT EXISTS households{suffix} (
+                id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                owner_id INTEGER,
+                owner_id TEXT,
                 invite_code TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE SET NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(owner_id) REFERENCES users{suffix}(id) ON DELETE SET NULL
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS household_members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                household_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+            f"""
+            CREATE TABLE IF NOT EXISTS household_members{suffix} (
+                id TEXT PRIMARY KEY,
+                household_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
                 role TEXT NOT NULL DEFAULT 'member',
-                FOREIGN KEY(household_id) REFERENCES households(id) ON DELETE CASCADE,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                created_at TEXT,
+                UNIQUE (household_id, user_id),
+                FOREIGN KEY(household_id) REFERENCES households{suffix}(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE CASCADE
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+            f"""
+            CREATE TABLE IF NOT EXISTS transactions{suffix} (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                household_id TEXT,
                 dato TEXT,
                 kategori TEXT,
                 beloeb REAL,
-                type TEXT
+                type TEXT,
+                note TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE SET NULL,
+                FOREIGN KEY(household_id) REFERENCES households{suffix}(id) ON DELETE CASCADE
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+            f"""
+            CREATE TABLE IF NOT EXISTS notifications{suffix} (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                household_id TEXT,
                 title TEXT,
                 message TEXT,
                 kind TEXT,
                 read INTEGER DEFAULT 0,
-                created_at TEXT
+                created_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE CASCADE,
+                FOREIGN KEY(household_id) REFERENCES households{suffix}(id) ON DELETE CASCADE
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS savings_goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                household_id INTEGER,
+            f"""
+            CREATE TABLE IF NOT EXISTS savings_goals{suffix} (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                household_id TEXT,
                 title TEXT NOT NULL,
                 target_amount REAL NOT NULL,
                 current_amount REAL NOT NULL DEFAULT 0,
                 due_date TEXT,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL,
-                FOREIGN KEY(household_id) REFERENCES households(id) ON DELETE CASCADE
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE SET NULL,
+                FOREIGN KEY(household_id) REFERENCES households{suffix}(id) ON DELETE CASCADE
             )
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
+            f"""
+            CREATE TABLE IF NOT EXISTS subscriptions{suffix} (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                household_id TEXT,
                 name TEXT NOT NULL,
                 amount REAL NOT NULL,
                 billing_date TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users{suffix}(id) ON DELETE SET NULL,
+                FOREIGN KEY(household_id) REFERENCES households{suffix}(id) ON DELETE CASCADE
             )
             """
         )
@@ -415,11 +476,11 @@ class DatabaseService:
             """
         )
         self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_queue (
+            f"""
+            CREATE TABLE IF NOT EXISTS sync_queue{suffix} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 table_name TEXT NOT NULL,
-                row_id INTEGER,
+                row_id TEXT,
                 operation TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -430,30 +491,245 @@ class DatabaseService:
             )
             """
         )
-        self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_id_map (
-                table_name TEXT NOT NULL,
-                local_id INTEGER NOT NULL,
-                remote_uuid TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (table_name, local_id)
-            )
-            """
-        )
 
-        self._ensure_column("transactions", "user_id", "user_id INTEGER")
-        self._ensure_column("transactions", "household_id", "household_id INTEGER")
-        self._ensure_column("notifications", "user_id", "user_id INTEGER")
-        self._ensure_column("notifications", "household_id", "household_id INTEGER")
-        self._ensure_column("subscriptions", "household_id", "household_id INTEGER")
-        self._ensure_column("savings_goals", "household_id", "household_id INTEGER")
+    def _remap_legacy_value(self, target_table: str, value: Any, id_maps: Dict[str, Dict[str, str]]) -> Any:
+        if value in (None, ""):
+            return value
+        return id_maps.get(target_table, {}).get(str(value), value)
+
+    def _remap_sync_payload_ids(
+        self,
+        table_name: str,
+        payload_text: str,
+        id_maps: Dict[str, Dict[str, str]],
+    ) -> str:
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return payload_text
+        if not isinstance(payload, dict):
+            return payload_text
+        payload["id"] = self._remap_legacy_value(table_name, payload.get("id"), id_maps)
+        for column_name, target_table in self.UUID_FOREIGN_KEYS.get(table_name, {}).items():
+            payload[column_name] = self._remap_legacy_value(target_table, payload.get(column_name), id_maps)
+        return json.dumps(payload, ensure_ascii=True)
+
+    def _migrate_integer_ids_to_uuid(self) -> None:
+        if not self._needs_uuid_migration():
+            self._create_uuid_schema()
+            if self.provider.table_exists("sync_id_map"):
+                self.provider.execute("DROP TABLE sync_id_map")
+                self.provider.commit()
+            return
+
+        id_maps: Dict[str, Dict[str, str]] = {table_name: {} for table_name in self.UUID_TABLES}
+        existing_rows: Dict[str, List[sqlite3.Row]] = {}
+        for table_name in self.UUID_TABLES:
+            if not self.provider.table_exists(table_name):
+                existing_rows[table_name] = []
+                continue
+            self.provider.execute(f"SELECT * FROM {table_name}")
+            rows = list(self.provider.fetchall())
+            existing_rows[table_name] = rows
+            for row in rows:
+                row_id = row["id"] if "id" in row.keys() else None
+                if row_id is not None:
+                    id_maps[table_name][str(row_id)] = str(row_id) if "-" in str(row_id) else self._new_uuid()
+
+        temp_suffix = "__uuid_migration"
+        self.provider.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for table_name in list(self.UUID_TABLES) + ["sync_queue"]:
+                self.provider.execute(f"DROP TABLE IF EXISTS {table_name}{temp_suffix}")
+            self._create_uuid_schema(temp_suffix)
+
+            for row in existing_rows["users"]:
+                self.provider.execute(
+                    f"INSERT INTO users{temp_suffix} (id, full_name, email, password_hash, created_at, last_login, role, avatar_url, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["users"][str(row["id"])],
+                        row["full_name"],
+                        row["email"],
+                        row["password_hash"],
+                        row["created_at"],
+                        row["last_login"] if "last_login" in row.keys() else None,
+                        row["role"] if "role" in row.keys() else "user",
+                        row["avatar_url"] if "avatar_url" in row.keys() else None,
+                        row["updated_at"] if "updated_at" in row.keys() else row["created_at"],
+                    ),
+                )
+
+            for row in existing_rows["sessions"]:
+                self.provider.execute(
+                    f"INSERT INTO sessions{temp_suffix} (id, user_id, token, device_name, platform, refresh_token_hash, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["sessions"][str(row["id"])],
+                        self._remap_legacy_value("users", row["user_id"], id_maps),
+                        row["token"],
+                        row["device_name"] if "device_name" in row.keys() else None,
+                        row["platform"] if "platform" in row.keys() else None,
+                        row["refresh_token_hash"] if "refresh_token_hash" in row.keys() else None,
+                        row["created_at"],
+                        row["expires_at"],
+                        row["revoked_at"] if "revoked_at" in row.keys() else None,
+                    ),
+                )
+
+            for row in existing_rows["households"]:
+                self.provider.execute(
+                    f"INSERT INTO households{temp_suffix} (id, name, owner_id, invite_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["households"][str(row["id"])],
+                        row["name"],
+                        self._remap_legacy_value("users", row["owner_id"], id_maps),
+                        row["invite_code"],
+                        row["created_at"],
+                        row["updated_at"] if "updated_at" in row.keys() else row["created_at"],
+                    ),
+                )
+
+            for row in existing_rows["household_members"]:
+                self.provider.execute(
+                    f"INSERT INTO household_members{temp_suffix} (id, household_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        id_maps["household_members"][str(row["id"])],
+                        self._remap_legacy_value("households", row["household_id"], id_maps),
+                        self._remap_legacy_value("users", row["user_id"], id_maps),
+                        row["role"] if "role" in row.keys() else "member",
+                        row["created_at"] if "created_at" in row.keys() else None,
+                    ),
+                )
+
+            for row in existing_rows["transactions"]:
+                self.provider.execute(
+                    f"INSERT INTO transactions{temp_suffix} (id, user_id, household_id, dato, kategori, beloeb, type, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["transactions"][str(row["id"])],
+                        self._remap_legacy_value("users", row["user_id"] if "user_id" in row.keys() else None, id_maps),
+                        self._remap_legacy_value("households", row["household_id"] if "household_id" in row.keys() else None, id_maps),
+                        row["dato"] if "dato" in row.keys() else None,
+                        row["kategori"] if "kategori" in row.keys() else None,
+                        row["beloeb"] if "beloeb" in row.keys() else None,
+                        row["type"] if "type" in row.keys() else None,
+                        row["note"] if "note" in row.keys() else None,
+                        row["created_at"] if "created_at" in row.keys() else None,
+                        row["updated_at"] if "updated_at" in row.keys() else row["created_at"] if "created_at" in row.keys() else None,
+                    ),
+                )
+
+            for row in existing_rows["subscriptions"]:
+                self.provider.execute(
+                    f"INSERT INTO subscriptions{temp_suffix} (id, user_id, household_id, name, amount, billing_date, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["subscriptions"][str(row["id"])],
+                        self._remap_legacy_value("users", row["user_id"] if "user_id" in row.keys() else None, id_maps),
+                        self._remap_legacy_value("households", row["household_id"] if "household_id" in row.keys() else None, id_maps),
+                        row["name"],
+                        row["amount"],
+                        row["billing_date"] if "billing_date" in row.keys() else None,
+                        row["active"] if "active" in row.keys() else 1,
+                        row["created_at"] if "created_at" in row.keys() else self._now(),
+                        row["updated_at"] if "updated_at" in row.keys() else row["created_at"] if "created_at" in row.keys() else self._now(),
+                    ),
+                )
+
+            for row in existing_rows["savings_goals"]:
+                self.provider.execute(
+                    f"INSERT INTO savings_goals{temp_suffix} (id, user_id, household_id, title, target_amount, current_amount, due_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["savings_goals"][str(row["id"])],
+                        self._remap_legacy_value("users", row["user_id"] if "user_id" in row.keys() else None, id_maps),
+                        self._remap_legacy_value("households", row["household_id"] if "household_id" in row.keys() else None, id_maps),
+                        row["title"],
+                        row["target_amount"],
+                        row["current_amount"] if "current_amount" in row.keys() else 0,
+                        row["due_date"] if "due_date" in row.keys() else None,
+                        row["created_at"] if "created_at" in row.keys() else self._now(),
+                        row["updated_at"] if "updated_at" in row.keys() else row["created_at"] if "created_at" in row.keys() else self._now(),
+                    ),
+                )
+
+            for row in existing_rows["notifications"]:
+                self.provider.execute(
+                    f"INSERT INTO notifications{temp_suffix} (id, user_id, household_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        id_maps["notifications"][str(row["id"])],
+                        self._remap_legacy_value("users", row["user_id"] if "user_id" in row.keys() else None, id_maps),
+                        self._remap_legacy_value("households", row["household_id"] if "household_id" in row.keys() else None, id_maps),
+                        row["title"] if "title" in row.keys() else None,
+                        row["message"] if "message" in row.keys() else None,
+                        row["kind"] if "kind" in row.keys() else None,
+                        row["read"] if "read" in row.keys() else 0,
+                        row["created_at"] if "created_at" in row.keys() else None,
+                    ),
+                )
+
+            if self.provider.table_exists("sync_queue"):
+                self.provider.execute("SELECT * FROM sync_queue ORDER BY id ASC")
+                for row in self.provider.fetchall():
+                    table_name = row["table_name"]
+                    mapped_row_id = self._remap_legacy_value(table_name, row["row_id"], id_maps)
+                    mapped_payload = self._remap_sync_payload_ids(table_name, row["payload"], id_maps)
+                    self.provider.execute(
+                        f"INSERT INTO sync_queue{temp_suffix} (id, table_name, row_id, operation, payload, created_at, synced, synced_at, retry_count, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            row["id"],
+                            table_name,
+                            mapped_row_id,
+                            row["operation"],
+                            mapped_payload,
+                            row["created_at"],
+                            row["synced"],
+                            row["synced_at"] if "synced_at" in row.keys() else None,
+                            row["retry_count"] if "retry_count" in row.keys() else 0,
+                            row["last_error"] if "last_error" in row.keys() else None,
+                        ),
+                    )
+
+            for table_name in ("sessions", "household_members", "transactions", "subscriptions", "savings_goals", "notifications", "households", "users", "sync_queue"):
+                if self.provider.table_exists(table_name):
+                    self.provider.execute(f"DROP TABLE {table_name}")
+            for table_name in self.UUID_TABLES + ("sync_queue",):
+                self.provider.execute(f"ALTER TABLE {table_name}{temp_suffix} RENAME TO {table_name}")
+            if self.provider.table_exists("sync_id_map"):
+                self.provider.execute("DROP TABLE sync_id_map")
+            self.provider.commit()
+        finally:
+            self.provider.execute("PRAGMA foreign_keys = ON")
+            self.provider.commit()
+
+    def _ensure_schema_columns(self) -> None:
+        self._ensure_column("users", "updated_at", "updated_at TEXT")
+        self._ensure_column("sessions", "device_name", "device_name TEXT")
+        self._ensure_column("sessions", "platform", "platform TEXT")
+        self._ensure_column("sessions", "refresh_token_hash", "refresh_token_hash TEXT")
+        self._ensure_column("sessions", "revoked_at", "revoked_at TEXT")
+        self._ensure_column("households", "updated_at", "updated_at TEXT")
+        self._ensure_column("transactions", "household_id", "household_id TEXT")
+        self._ensure_column("transactions", "note", "note TEXT")
+        self._ensure_column("transactions", "created_at", "created_at TEXT")
+        self._ensure_column("transactions", "updated_at", "updated_at TEXT")
+        self._ensure_column("notifications", "household_id", "household_id TEXT")
+        self._ensure_column("subscriptions", "household_id", "household_id TEXT")
+        self._ensure_column("subscriptions", "updated_at", "updated_at TEXT")
+        self._ensure_column("savings_goals", "household_id", "household_id TEXT")
+        self._ensure_column("savings_goals", "updated_at", "updated_at TEXT")
+        self.provider.execute("UPDATE users SET updated_at = COALESCE(updated_at, created_at)")
+        self.provider.execute("UPDATE households SET updated_at = COALESCE(updated_at, created_at)")
+        self.provider.execute("UPDATE transactions SET updated_at = COALESCE(updated_at, created_at)")
+        self.provider.execute("UPDATE subscriptions SET updated_at = COALESCE(updated_at, created_at)")
+        self.provider.execute("UPDATE savings_goals SET updated_at = COALESCE(updated_at, created_at)")
         self.provider.commit()
+
+    def init_db(self) -> None:
+        self.provider.execute("PRAGMA foreign_keys = ON")
+        self._migrate_integer_ids_to_uuid()
+        self._ensure_schema_columns()
 
     def set_sync_transport(self, transport: Any) -> None:
         self._sync_transport = transport
 
-    def enqueue_sync(self, table_name: str, row_id: Optional[int], operation: str, payload: Dict[str, Any]) -> int:
+    def enqueue_sync(self, table_name: str, row_id: Optional[str], operation: str, payload: Dict[str, Any]) -> int:
         self.provider.execute(
             "INSERT INTO sync_queue (table_name, row_id, operation, payload, created_at, synced) VALUES (?, ?, ?, ?, ?, 0)",
             (table_name, row_id, operation, json.dumps(payload, ensure_ascii=True), self._now()),
@@ -466,30 +742,6 @@ class DatabaseService:
             return {}
         return {key: row[key] for key in row.keys()}
 
-    def _get_remote_uuid(self, table_name: str, local_id: Optional[int]) -> str:
-        if local_id is None:
-            return ""
-        self.provider.execute(
-            "SELECT remote_uuid FROM sync_id_map WHERE table_name = ? AND local_id = ?",
-            (table_name, local_id),
-        )
-        row = self.provider.fetchone()
-        return row["remote_uuid"] if row is not None else ""
-
-    def _set_remote_uuid(self, table_name: str, local_id: Optional[int], remote_uuid: str) -> None:
-        if local_id is None or not remote_uuid:
-            return
-        self.provider.execute(
-            """
-            INSERT INTO sync_id_map (table_name, local_id, remote_uuid, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(table_name, local_id)
-            DO UPDATE SET remote_uuid = excluded.remote_uuid
-            """,
-            (table_name, local_id, remote_uuid, self._now()),
-        )
-        self.provider.commit()
-
     def _normalize_supabase_value(self, column_name: str, value: Any) -> Any:
         if value in ("", None):
             return None if value == "" else value
@@ -497,23 +749,10 @@ class DatabaseService:
             return bool(value)
         return value
 
-    def _map_supabase_foreign_key(self, table_name: str, column_name: str, value: Any) -> Any:
-        if value in (None, ""):
-            return None
-        target_table = self.SUPABASE_FOREIGN_KEYS.get(table_name, {}).get(column_name)
-        if target_table is None:
-            return value
-        remote_uuid = self._get_remote_uuid(target_table, int(value))
-        if not remote_uuid:
-            raise RuntimeError(
-                f"Mangler remote UUID for {target_table}.{value} referenced by {table_name}.{column_name}"
-            )
-        return remote_uuid
-
     def _build_supabase_sync_item(
         self,
         table_name: str,
-        row_id: Optional[int],
+        row_id: Optional[str],
         operation: str,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -521,26 +760,19 @@ class DatabaseService:
         if allowed_columns is None:
             raise RuntimeError(f"Sync mapping mangler for tabel {table_name}")
 
-        remote_row_id = self._get_remote_uuid(table_name, row_id)
-        if operation == "delete" and not remote_row_id:
-            return {"skip": True, "reason": "No remote UUID for delete", "operation": operation, "payload": {}, "remote_row_id": ""}
-
         mapped_payload: Dict[str, Any] = {}
         for column_name, raw_value in payload.items():
             if column_name not in allowed_columns:
                 continue
             normalized_value = self._normalize_supabase_value(column_name, raw_value)
-            mapped_payload[column_name] = self._map_supabase_foreign_key(table_name, column_name, normalized_value)
-
-        if operation == "update" and not remote_row_id:
-            operation = "insert"
+            mapped_payload[column_name] = normalized_value
 
         print("[SYNC] Payload after mapping:", json.dumps(mapped_payload, ensure_ascii=True, default=str))
         return {
             "skip": False,
             "operation": operation,
             "payload": mapped_payload,
-            "remote_row_id": remote_row_id,
+            "remote_row_id": row_id or "",
         }
 
     def get_sync_status(self) -> Dict[str, Any]:
@@ -676,9 +908,6 @@ class DatabaseService:
                     operation=sync_item["operation"],
                     payload=sync_item["payload"],
                 )
-                remote_uuid = response_payload.get("id", "") if isinstance(response_payload, dict) else ""
-                if remote_uuid:
-                    self._set_remote_uuid(item["table_name"], item["row_id"], str(remote_uuid))
                 self.mark_sync_item_synced(int(item["id"]))
                 synced += 1
                 last_synced_at = self._now()
@@ -721,7 +950,7 @@ class DatabaseService:
         self.provider.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),))
         return self.provider.fetchone()
 
-    def get_user_by_id(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_user_by_id(self, user_id: str) -> Optional[sqlite3.Row]:
         self.provider.execute("SELECT * FROM users WHERE id = ?", (user_id,))
         return self.provider.fetchone()
 
@@ -730,16 +959,16 @@ class DatabaseService:
         row = self.provider.fetchone()
         return int(row["count"]) if row else 0
 
-    def create_user(self, full_name: str, email: str, password: str, role: str = "user") -> int:
+    def create_user(self, full_name: str, email: str, password: str, role: str = "user") -> str:
         print(f"[DB] create_user called via {self.provider.__class__.__name__}")
+        user_id = self._new_uuid()
         password_hash = self._hash_password(password)
         created_at = self._now()
         self.provider.execute(
-            "INSERT INTO users (full_name, email, password_hash, created_at, role) VALUES (?, ?, ?, ?, ?)",
-            (full_name.strip(), email.lower().strip(), password_hash, created_at, role),
+            "INSERT INTO users (id, full_name, email, password_hash, created_at, role, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, full_name.strip(), email.lower().strip(), password_hash, created_at, role, created_at),
         )
         self.provider.commit()
-        user_id = int(self.provider.lastrowid())
         self.enqueue_sync("users", user_id, "insert", self._row_to_payload(self.get_user_by_id(user_id)))
         return user_id
 
@@ -750,20 +979,21 @@ class DatabaseService:
         if not self._verify_password(password, user["password_hash"]):
             return None
         self.provider.execute(
-            "UPDATE users SET last_login = ? WHERE id = ?",
-            (self._now(), user["id"]),
+            "UPDATE users SET last_login = ?, updated_at = ? WHERE id = ?",
+            (self._now(), self._now(), user["id"]),
         )
         self.provider.commit()
-        self.enqueue_sync("users", int(user["id"]), "update", self._row_to_payload(self.get_user_by_id(int(user["id"]))))
+        self.enqueue_sync("users", str(user["id"]), "update", self._row_to_payload(self.get_user_by_id(str(user["id"]))))
         return self.get_user_by_id(user["id"])
 
-    def create_session(self, user_id: int, expires_in_hours: int = 30) -> str:
+    def create_session(self, user_id: str, expires_in_hours: int = 30) -> str:
+        session_id = self._new_uuid()
         token = uuid.uuid4().hex
         created_at = self._now()
         expires_at = (datetime.now() + timedelta(hours=expires_in_hours)).isoformat(sep=" ", timespec="seconds")
         self.provider.execute(
-            "INSERT INTO sessions (user_id, token, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (user_id, token, created_at, expires_at),
+            "INSERT INTO sessions (id, user_id, token, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, user_id, token, created_at, expires_at),
         )
         self.provider.commit()
         return token
@@ -788,33 +1018,36 @@ class DatabaseService:
     def logout_user(self, token: str) -> None:
         self.logout_session(token)
 
-    def update_user_email(self, user_id: int, email: str) -> None:
+    def update_user_email(self, user_id: str, email: str) -> None:
         self.provider.execute("UPDATE users SET email = ? WHERE id = ?", (email.lower().strip(), user_id))
+        self.provider.execute("UPDATE users SET updated_at = ? WHERE id = ?", (self._now(), user_id))
         self.provider.commit()
         self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
-    def update_user_avatar(self, user_id: int, avatar_url: str) -> None:
+    def update_user_avatar(self, user_id: str, avatar_url: str) -> None:
         self.provider.execute("UPDATE users SET avatar_url = ? WHERE id = ?", (avatar_url, user_id))
+        self.provider.execute("UPDATE users SET updated_at = ? WHERE id = ?", (self._now(), user_id))
         self.provider.commit()
         self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def _generate_invite_code(self) -> str:
         return uuid.uuid4().hex[:8].upper()
 
-    def create_household(self, name: str, owner_id: int) -> Tuple[int, str]:
+    def create_household(self, name: str, owner_id: str) -> Tuple[str, str]:
+        household_id = self._new_uuid()
         invite_code = self._generate_invite_code()
         created_at = self._now()
         self.provider.execute(
-            "INSERT INTO households (name, owner_id, invite_code, created_at) VALUES (?, ?, ?, ?)",
-            (name.strip(), owner_id, invite_code, created_at),
+            "INSERT INTO households (id, name, owner_id, invite_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (household_id, name.strip(), owner_id, invite_code, created_at, created_at),
         )
-        household_id = int(self.provider.lastrowid())
         self.add_household_member(household_id, owner_id, "owner")
         self.provider.commit()
         self.enqueue_sync("households", household_id, "insert", self._row_to_payload(self.get_household_by_code(invite_code)))
         return household_id, invite_code
 
-    def add_household_member(self, household_id: int, user_id: int, role: str = "member") -> None:
+    def add_household_member(self, household_id: str, user_id: str, role: str = "member") -> None:
+        member_id = self._new_uuid()
         self.provider.execute(
             "SELECT id FROM household_members WHERE household_id = ? AND user_id = ?",
             (household_id, user_id),
@@ -822,8 +1055,8 @@ class DatabaseService:
         if self.provider.fetchone() is not None:
             return
         self.provider.execute(
-            "INSERT INTO household_members (household_id, user_id, role) VALUES (?, ?, ?)",
-            (household_id, user_id, role),
+            "INSERT INTO household_members (id, household_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            (member_id, household_id, user_id, role, self._now()),
         )
         self.provider.commit()
         self.provider.execute(
@@ -831,54 +1064,54 @@ class DatabaseService:
             (household_id, user_id),
         )
         member_row = self.provider.fetchone()
-        self.enqueue_sync("household_members", int(member_row["id"]) if member_row is not None else None, "insert", self._row_to_payload(member_row))
+        self.enqueue_sync("household_members", str(member_row["id"]) if member_row is not None else None, "insert", self._row_to_payload(member_row))
 
     def get_household_by_code(self, invite_code: str) -> Optional[sqlite3.Row]:
         self.provider.execute("SELECT * FROM households WHERE invite_code = ?", (invite_code.strip().upper(),))
         return self.provider.fetchone()
 
-    def regenerate_household_invite_code(self, household_id: int) -> str:
+    def regenerate_household_invite_code(self, household_id: str) -> str:
         invite_code = self._generate_invite_code()
         self.provider.execute(
-            "UPDATE households SET invite_code = ? WHERE id = ?",
-            (invite_code, household_id),
+            "UPDATE households SET invite_code = ?, updated_at = ? WHERE id = ?",
+            (invite_code, self._now(), household_id),
         )
         self.provider.commit()
         self.enqueue_sync("households", household_id, "update", self._row_to_payload(self.get_household_by_code(invite_code)))
         return invite_code
 
-    def join_household(self, user_id: int, invite_code: str) -> bool:
+    def join_household(self, user_id: str, invite_code: str) -> bool:
         household = self.get_household_by_code(invite_code)
         if household is None:
             return False
         self.add_household_member(household["id"], user_id, "member")
         return True
 
-    def get_household_for_user(self, user_id: int) -> Optional[sqlite3.Row]:
+    def get_household_for_user(self, user_id: str) -> Optional[sqlite3.Row]:
         self.provider.execute(
             "SELECT households.* FROM households JOIN household_members ON household_members.household_id = households.id WHERE household_members.user_id = ? LIMIT 1",
             (user_id,),
         )
         return self.provider.fetchone()
 
-    def is_user_in_household(self, user_id: int) -> bool:
+    def is_user_in_household(self, user_id: str) -> bool:
         return self.get_household_for_user(user_id) is not None
 
-    def get_households_for_user(self, user_id: int) -> List[sqlite3.Row]:
+    def get_households_for_user(self, user_id: str) -> List[sqlite3.Row]:
         self.provider.execute(
             "SELECT households.* FROM households JOIN household_members ON household_members.household_id = households.id WHERE household_members.user_id = ?",
             (user_id,),
         )
         return list(self.provider.fetchall())
 
-    def get_household_members(self, household_id: int) -> List[sqlite3.Row]:
+    def get_household_members(self, household_id: str) -> List[sqlite3.Row]:
         self.provider.execute(
             "SELECT users.id as user_id, users.full_name, users.email, household_members.role FROM household_members JOIN users ON users.id = household_members.user_id WHERE household_members.household_id = ?",
             (household_id,),
         )
         return list(self.provider.fetchall())
 
-    def get_household_member_role(self, household_id: int, user_id: int) -> Optional[str]:
+    def get_household_member_role(self, household_id: str, user_id: str) -> Optional[str]:
         self.provider.execute(
             "SELECT role FROM household_members WHERE household_id = ? AND user_id = ?",
             (household_id, user_id),
@@ -886,11 +1119,11 @@ class DatabaseService:
         row = self.provider.fetchone()
         return str(row["role"]) if row is not None else None
 
-    def is_household_admin(self, household_id: int, user_id: int) -> bool:
+    def is_household_admin(self, household_id: str, user_id: str) -> bool:
         role = self.get_household_member_role(household_id, user_id)
         return role in ("owner", "admin")
 
-    def change_household_member_role(self, household_id: int, target_user_id: int, new_role: str) -> None:
+    def change_household_member_role(self, household_id: str, target_user_id: str, new_role: str) -> None:
         self.provider.execute(
             "UPDATE household_members SET role = ? WHERE household_id = ? AND user_id = ?",
             (new_role, household_id, target_user_id),
@@ -901,9 +1134,9 @@ class DatabaseService:
             (household_id, target_user_id),
         )
         member_row = self.provider.fetchone()
-        self.enqueue_sync("household_members", int(member_row["id"]) if member_row is not None else None, "update", self._row_to_payload(member_row))
+        self.enqueue_sync("household_members", str(member_row["id"]) if member_row is not None else None, "update", self._row_to_payload(member_row))
 
-    def remove_household_member(self, household_id: int, target_user_id: int) -> None:
+    def remove_household_member(self, household_id: str, target_user_id: str) -> None:
         self.provider.execute(
             "SELECT * FROM household_members WHERE household_id = ? AND user_id = ?",
             (household_id, target_user_id),
@@ -914,9 +1147,9 @@ class DatabaseService:
             (household_id, target_user_id),
         )
         self.provider.commit()
-        self.enqueue_sync("household_members", None, "delete", self._row_to_payload(payload_row))
+        self.enqueue_sync("household_members", str(payload_row["id"]) if payload_row is not None else None, "delete", self._row_to_payload(payload_row))
 
-    def leave_household(self, household_id: int, user_id: int) -> None:
+    def leave_household(self, household_id: str, user_id: str) -> None:
         self.provider.execute("SELECT owner_id FROM households WHERE id = ?", (household_id,))
         household = self.provider.fetchone()
         if household is None:
@@ -928,7 +1161,7 @@ class DatabaseService:
             return
 
         self.provider.execute(
-            "SELECT user_id FROM household_members WHERE household_id = ? ORDER BY id ASC LIMIT 1",
+            "SELECT user_id FROM household_members WHERE household_id = ? ORDER BY created_at ASC, id ASC LIMIT 1",
             (household_id,),
         )
         next_owner = self.provider.fetchone()
@@ -938,8 +1171,8 @@ class DatabaseService:
 
         new_owner_id = next_owner["user_id"]
         self.provider.execute(
-            "UPDATE households SET owner_id = ? WHERE id = ?",
-            (new_owner_id, household_id),
+            "UPDATE households SET owner_id = ?, updated_at = ? WHERE id = ?",
+            (new_owner_id, self._now(), household_id),
         )
         self.provider.execute(
             "UPDATE household_members SET role = 'owner' WHERE household_id = ? AND user_id = ?",
@@ -953,22 +1186,22 @@ class DatabaseService:
             (household_id, new_owner_id),
         )
         owner_member_row = self.provider.fetchone()
-        self.enqueue_sync("household_members", int(owner_member_row["id"]) if owner_member_row is not None else None, "update", self._row_to_payload(owner_member_row))
+        self.enqueue_sync("household_members", str(owner_member_row["id"]) if owner_member_row is not None else None, "update", self._row_to_payload(owner_member_row))
 
-    def delete_household(self, household_id: int) -> None:
+    def delete_household(self, household_id: str) -> None:
         self.provider.execute("SELECT * FROM households WHERE id = ?", (household_id,))
         payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM households WHERE id = ?", (household_id,))
         self.provider.commit()
         self.enqueue_sync("households", household_id, "delete", self._row_to_payload(payload_row))
 
-    def get_household_financial_summary(self, household_id: int) -> Dict[str, Any]:
+    def get_household_financial_summary(self, household_id: str) -> Dict[str, Any]:
         self.provider.execute(
             "SELECT user_id FROM household_members WHERE household_id = ?",
             (household_id,),
         )
         member_rows = list(self.provider.fetchall())
-        member_ids = [int(row["user_id"]) for row in member_rows]
+        member_ids = [str(row["user_id"]) for row in member_rows]
         member_placeholders = ",".join("?" for _ in member_ids)
         member_clause = f"user_id IN ({member_placeholders})" if member_ids else "0=1"
 
@@ -1011,13 +1244,13 @@ class DatabaseService:
             "member_count": member_count,
         }
 
-    def get_household_family_analysis(self, household_id: int) -> Dict[str, Any]:
+    def get_household_family_analysis(self, household_id: str) -> Dict[str, Any]:
         self.provider.execute(
             "SELECT user_id FROM household_members WHERE household_id = ?",
             (household_id,),
         )
         member_rows = list(self.provider.fetchall())
-        member_ids = [int(row["user_id"]) for row in member_rows]
+        member_ids = [str(row["user_id"]) for row in member_rows]
         member_placeholders = ",".join("?" for _ in member_ids)
         member_clause = f"user_id IN ({member_placeholders})" if member_ids else "0=1"
 
@@ -1078,97 +1311,97 @@ class DatabaseService:
 
     def save_transaction(
         self,
-        user_id: Optional[int],
+        user_id: Optional[str],
         dato: str,
         kategori: str,
         beloeb: float,
         type_: str,
-        household_id: Optional[int] = None,
-    ) -> int:
+        household_id: Optional[str] = None,
+    ) -> str:
+        transaction_id = self._new_uuid()
         has_user = self.provider.has_column("transactions", "user_id")
         has_household = self.provider.has_column("transactions", "household_id")
         if has_user and has_household:
             self.provider.execute(
-                "INSERT INTO transactions (user_id, household_id, dato, kategori, beloeb, type) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, household_id, dato, kategori.strip(), beloeb, type_.strip()),
+                "INSERT INTO transactions (id, user_id, household_id, dato, kategori, beloeb, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (transaction_id, user_id, household_id, dato, kategori.strip(), beloeb, type_.strip(), self._now(), self._now()),
             )
         elif has_user:
             self.provider.execute(
-                "INSERT INTO transactions (user_id, dato, kategori, beloeb, type) VALUES (?, ?, ?, ?, ?)",
-                (user_id, dato, kategori.strip(), beloeb, type_.strip()),
+                "INSERT INTO transactions (id, user_id, dato, kategori, beloeb, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (transaction_id, user_id, dato, kategori.strip(), beloeb, type_.strip(), self._now(), self._now()),
             )
         else:
             self.provider.execute(
-                "INSERT INTO transactions (dato, kategori, beloeb, type) VALUES (?, ?, ?, ?)",
-                (dato, kategori.strip(), beloeb, type_.strip()),
+                "INSERT INTO transactions (id, dato, kategori, beloeb, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (transaction_id, dato, kategori.strip(), beloeb, type_.strip(), self._now(), self._now()),
             )
         self.provider.commit()
-        row_id = int(self.provider.lastrowid())
-        self.provider.execute("SELECT * FROM transactions WHERE id = ?", (row_id,))
-        self.enqueue_sync("transactions", row_id, "insert", self._row_to_payload(self.provider.fetchone()))
-        return row_id
+        self.provider.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,))
+        self.enqueue_sync("transactions", transaction_id, "insert", self._row_to_payload(self.provider.fetchone()))
+        return transaction_id
 
-    def get_transactions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+    def get_transactions(self, user_id: Optional[str] = None) -> List[sqlite3.Row]:
         has_user = self.provider.has_column("transactions", "user_id")
         has_household = self.provider.has_column("transactions", "household_id")
         if has_user:
             if user_id is None:
-                self.provider.execute("SELECT * FROM transactions ORDER BY id DESC")
+                self.provider.execute("SELECT * FROM transactions ORDER BY created_at DESC, id DESC")
             elif has_household:
                 household = self.get_household_for_user(user_id)
                 if household is None:
                     self.provider.execute(
-                        "SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC",
+                        "SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC, id DESC",
                         (user_id,),
                     )
                 else:
                     self.provider.execute(
-                        "SELECT * FROM transactions WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                        "SELECT * FROM transactions WHERE user_id = ? OR household_id = ? ORDER BY created_at DESC, id DESC",
                         (user_id, household["id"]),
                     )
             else:
                 self.provider.execute(
-                    "SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC",
+                    "SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC, id DESC",
                     (user_id,),
                 )
         else:
-            self.provider.execute("SELECT * FROM transactions ORDER BY id DESC")
+            self.provider.execute("SELECT * FROM transactions ORDER BY created_at DESC, id DESC")
         return list(self.provider.fetchall())
 
-    def load_transactions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+    def load_transactions(self, user_id: Optional[str] = None) -> List[sqlite3.Row]:
         return self.get_transactions(user_id)
 
     def update_transaction(
         self,
-        transaction_id: int,
+        transaction_id: str,
         dato: str,
         kategori: str,
         beloeb: float,
         type_: str,
-        household_id: Optional[int] = None,
+        household_id: Optional[str] = None,
     ) -> None:
         if self.provider.has_column("transactions", "household_id"):
             self.provider.execute(
-                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ?, household_id = ? WHERE id = ?",
-                (dato, kategori.strip(), beloeb, type_.strip(), household_id, transaction_id),
+                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ?, household_id = ?, updated_at = ? WHERE id = ?",
+                (dato, kategori.strip(), beloeb, type_.strip(), household_id, self._now(), transaction_id),
             )
         else:
             self.provider.execute(
-                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ? WHERE id = ?",
-                (dato, kategori.strip(), beloeb, type_.strip(), transaction_id),
+                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ?, updated_at = ? WHERE id = ?",
+                (dato, kategori.strip(), beloeb, type_.strip(), self._now(), transaction_id),
             )
         self.provider.commit()
         self.provider.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,))
         self.enqueue_sync("transactions", transaction_id, "update", self._row_to_payload(self.provider.fetchone()))
 
-    def delete_transaction(self, transaction_id: int) -> None:
+    def delete_transaction(self, transaction_id: str) -> None:
         self.provider.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,))
         payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
         self.provider.commit()
         self.enqueue_sync("transactions", transaction_id, "delete", self._row_to_payload(payload_row))
 
-    def get_notifications(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+    def get_notifications(self, user_id: Optional[str] = None) -> List[sqlite3.Row]:
         has_user = self.provider.has_column("notifications", "user_id")
         has_household = self.provider.has_column("notifications", "household_id")
         if has_user and user_id is not None:
@@ -1176,30 +1409,30 @@ class DatabaseService:
                 household = self.get_household_for_user(user_id)
                 if household is None:
                     self.provider.execute(
-                        "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+                        "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 8",
                         (user_id,),
                     )
                 else:
                     self.provider.execute(
-                        "SELECT * FROM notifications WHERE user_id = ? OR household_id = ? ORDER BY id DESC LIMIT 8",
+                        "SELECT * FROM notifications WHERE user_id = ? OR household_id = ? ORDER BY created_at DESC, id DESC LIMIT 8",
                         (user_id, household["id"]),
                     )
             else:
                 self.provider.execute(
-                    "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+                    "SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT 8",
                     (user_id,),
                 )
         else:
-            self.provider.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 8")
+            self.provider.execute("SELECT * FROM notifications ORDER BY created_at DESC, id DESC LIMIT 8")
         return list(self.provider.fetchall())
 
     def save_notification(
         self,
-        user_id: Optional[int],
+        user_id: Optional[str],
         title: str,
         message: str,
         kind: str,
-        household_id: Optional[int] = None,
+        household_id: Optional[str] = None,
     ) -> None:
         has_user = self.provider.has_column("notifications", "user_id")
         has_household = self.provider.has_column("notifications", "household_id")
@@ -1223,102 +1456,102 @@ class DatabaseService:
             exists = self.provider.fetchone() is not None
 
         if not exists:
+            notification_id = self._new_uuid()
             if has_user and has_household:
                 self.provider.execute(
-                    "INSERT INTO notifications (user_id, household_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (user_id, household_id, title, message, kind, 0, self._now()),
+                    "INSERT INTO notifications (id, user_id, household_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (notification_id, user_id, household_id, title, message, kind, 0, self._now()),
                 )
             elif has_user:
                 self.provider.execute(
-                    "INSERT INTO notifications (user_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, title, message, kind, 0, self._now()),
+                    "INSERT INTO notifications (id, user_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (notification_id, user_id, title, message, kind, 0, self._now()),
                 )
             else:
                 self.provider.execute(
-                    "INSERT INTO notifications (title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (title, message, kind, 0, self._now()),
+                    "INSERT INTO notifications (id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (notification_id, title, message, kind, 0, self._now()),
                 )
             self.provider.commit()
             if has_user and user_id is not None:
-                self.provider.execute(
-                    "SELECT * FROM notifications WHERE user_id = ? AND title = ? AND message = ? ORDER BY id DESC LIMIT 1",
-                    (user_id, title, message),
-                )
+                self.provider.execute("SELECT * FROM notifications WHERE id = ?", (notification_id,))
                 notif_row = self.provider.fetchone()
-                self.enqueue_sync("notifications", int(notif_row["id"]) if notif_row is not None else None, "insert", self._row_to_payload(notif_row))
+                self.enqueue_sync("notifications", str(notif_row["id"]) if notif_row is not None else None, "insert", self._row_to_payload(notif_row))
 
-    def mark_all_notifications_read(self, user_id: Optional[int] = None) -> None:
+    def mark_all_notifications_read(self, user_id: Optional[str] = None) -> None:
         if self.provider.has_column("notifications", "user_id") and user_id is not None:
             self.provider.execute("SELECT * FROM notifications WHERE user_id = ? AND read = 0", (user_id,))
             unread_rows = list(self.provider.fetchall())
             self.provider.execute("UPDATE notifications SET read = 1 WHERE user_id = ?", (user_id,))
             for unread_row in unread_rows:
-                self.enqueue_sync("notifications", int(unread_row["id"]), "update", {**self._row_to_payload(unread_row), "read": 1})
+                self.enqueue_sync("notifications", str(unread_row["id"]), "update", {**self._row_to_payload(unread_row), "read": 1})
         else:
             self.provider.execute("UPDATE notifications SET read = 1")
         self.provider.commit()
 
-    def update_user_profile(self, user_id: int, full_name: str) -> None:
+    def update_user_profile(self, user_id: str, full_name: str) -> None:
         self.provider.execute("UPDATE users SET full_name = ? WHERE id = ?", (full_name.strip(), user_id))
+        self.provider.execute("UPDATE users SET updated_at = ? WHERE id = ?", (self._now(), user_id))
         self.provider.commit()
         self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
-    def change_password(self, user_id: int, new_password: str) -> None:
+    def change_password(self, user_id: str, new_password: str) -> None:
         password_hash = self._hash_password(new_password)
         self.provider.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
+        self.provider.execute("UPDATE users SET updated_at = ? WHERE id = ?", (self._now(), user_id))
         self.provider.commit()
         self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def create_savings_goal(
         self,
-        user_id: Optional[int],
+        user_id: Optional[str],
         title: str,
         target_amount: float,
         due_date: Optional[str] = None,
-        household_id: Optional[int] = None,
-    ) -> int:
+        household_id: Optional[str] = None,
+    ) -> str:
+        goal_id = self._new_uuid()
         self.provider.execute(
-            "INSERT INTO savings_goals (user_id, household_id, title, target_amount, current_amount, due_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, household_id, title.strip(), target_amount, 0.0, due_date, self._now()),
+            "INSERT INTO savings_goals (id, user_id, household_id, title, target_amount, current_amount, due_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (goal_id, user_id, household_id, title.strip(), target_amount, 0.0, due_date, self._now(), self._now()),
         )
         self.provider.commit()
-        goal_id = int(self.provider.lastrowid())
         self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
         self.enqueue_sync("savings_goals", goal_id, "insert", self._row_to_payload(self.provider.fetchone()))
         return goal_id
 
-    def get_savings_goals(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+    def get_savings_goals(self, user_id: Optional[str] = None) -> List[sqlite3.Row]:
         if user_id is not None:
             household = self.get_household_for_user(user_id)
             if household is None:
-                self.provider.execute("SELECT * FROM savings_goals WHERE user_id = ? ORDER BY id DESC", (user_id,))
+                self.provider.execute("SELECT * FROM savings_goals WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user_id,))
             else:
                 self.provider.execute(
-                    "SELECT * FROM savings_goals WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                    "SELECT * FROM savings_goals WHERE user_id = ? OR household_id = ? ORDER BY created_at DESC, id DESC",
                     (user_id, household["id"]),
                 )
         else:
-            self.provider.execute("SELECT * FROM savings_goals ORDER BY id DESC")
+            self.provider.execute("SELECT * FROM savings_goals ORDER BY created_at DESC, id DESC")
         return list(self.provider.fetchall())
 
     def update_savings_goal(
         self,
-        goal_id: int,
+        goal_id: str,
         title: str,
         target_amount: float,
         current_amount: float,
         due_date: Optional[str] = None,
-        household_id: Optional[int] = None,
+        household_id: Optional[str] = None,
     ) -> None:
         self.provider.execute(
-            "UPDATE savings_goals SET title = ?, target_amount = ?, current_amount = ?, due_date = ?, household_id = ? WHERE id = ?",
-            (title.strip(), target_amount, current_amount, due_date, household_id, goal_id),
+            "UPDATE savings_goals SET title = ?, target_amount = ?, current_amount = ?, due_date = ?, household_id = ?, updated_at = ? WHERE id = ?",
+            (title.strip(), target_amount, current_amount, due_date, household_id, self._now(), goal_id),
         )
         self.provider.commit()
         self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
         self.enqueue_sync("savings_goals", goal_id, "update", self._row_to_payload(self.provider.fetchone()))
 
-    def delete_savings_goal(self, goal_id: int) -> None:
+    def delete_savings_goal(self, goal_id: str) -> None:
         self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
         payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM savings_goals WHERE id = ?", (goal_id,))
@@ -1327,55 +1560,55 @@ class DatabaseService:
 
     def create_subscription(
         self,
-        user_id: Optional[int],
+        user_id: Optional[str],
         name: str,
         amount: float,
         billing_date: Optional[str] = None,
         active: bool = True,
-        household_id: Optional[int] = None,
-    ) -> int:
+        household_id: Optional[str] = None,
+    ) -> str:
+        subscription_id = self._new_uuid()
         if self.provider.has_column("subscriptions", "household_id"):
             self.provider.execute(
-                "INSERT INTO subscriptions (user_id, household_id, name, amount, billing_date, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (user_id, household_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
+                "INSERT INTO subscriptions (id, user_id, household_id, name, amount, billing_date, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (subscription_id, user_id, household_id, name.strip(), amount, billing_date, 1 if active else 0, self._now(), self._now()),
             )
         else:
             self.provider.execute(
-                "INSERT INTO subscriptions (user_id, name, amount, billing_date, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
+                "INSERT INTO subscriptions (id, user_id, name, amount, billing_date, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (subscription_id, user_id, name.strip(), amount, billing_date, 1 if active else 0, self._now(), self._now()),
             )
         self.provider.commit()
-        subscription_id = int(self.provider.lastrowid())
         self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
         self.enqueue_sync("subscriptions", subscription_id, "insert", self._row_to_payload(self.provider.fetchone()))
         return subscription_id
 
-    def get_subscriptions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+    def get_subscriptions(self, user_id: Optional[str] = None) -> List[sqlite3.Row]:
         has_household = self.provider.has_column("subscriptions", "household_id")
         if user_id is not None:
             if has_household:
                 household = self.get_household_for_user(user_id)
                 if household is None:
-                    self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC", (user_id,))
+                    self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user_id,))
                 else:
                     self.provider.execute(
-                        "SELECT * FROM subscriptions WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                        "SELECT * FROM subscriptions WHERE user_id = ? OR household_id = ? ORDER BY created_at DESC, id DESC",
                         (user_id, household["id"]),
                     )
             else:
-                self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC", (user_id,))
+                self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC, id DESC", (user_id,))
         else:
-            self.provider.execute("SELECT * FROM subscriptions ORDER BY id DESC")
+            self.provider.execute("SELECT * FROM subscriptions ORDER BY created_at DESC, id DESC")
         return list(self.provider.fetchall())
 
     def update_subscription(
         self,
-        subscription_id: int,
+        subscription_id: str,
         name: str,
         amount: float,
         billing_date: Optional[str] = None,
         active: bool = True,
-        household_id: Optional[int] = None,
+        household_id: Optional[str] = None,
     ) -> None:
         if self.provider.has_column("subscriptions", "household_id"):
             self.provider.execute(
@@ -1387,11 +1620,12 @@ class DatabaseService:
                 "UPDATE subscriptions SET name = ?, amount = ?, billing_date = ?, active = ? WHERE id = ?",
                 (name.strip(), amount, billing_date, 1 if active else 0, subscription_id),
             )
+        self.provider.execute("UPDATE subscriptions SET updated_at = ? WHERE id = ?", (self._now(), subscription_id))
         self.provider.commit()
         self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
         self.enqueue_sync("subscriptions", subscription_id, "update", self._row_to_payload(self.provider.fetchone()))
 
-    def delete_subscription(self, subscription_id: int) -> None:
+    def delete_subscription(self, subscription_id: str) -> None:
         self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
         payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))

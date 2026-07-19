@@ -160,7 +160,7 @@ class LoginWindow(tk.Toplevel):
             if user is None:
                 messagebox.showerror("Fejl", "E-mail eller password er forkert.")
                 return
-            token = self.service.create_session(int(user["id"]))
+            token = self.service.create_session(str(user["id"]))
             self.on_success(user, token)
             self.destroy()
         except Exception as exc:
@@ -236,7 +236,7 @@ class FamilBudgetApp(tk.Tk):
             user = self.service.validate_session(self.session_token)
             if user is not None:
                 self.current_user = user
-                self.current_user_id = int(user["id"])
+                self.current_user_id = str(user["id"])
                 self.user_name = user["full_name"]
                 self.refresh_household_state()
 
@@ -310,7 +310,7 @@ class FamilBudgetApp(tk.Tk):
 
     def on_auth_success(self, user, token):
         self.current_user = user
-        self.current_user_id = int(user["id"])
+        self.current_user_id = str(user["id"])
         self.user_name = user["full_name"]
         self.session_token = token
         self.service.save_setting("session_token", token)
@@ -392,7 +392,7 @@ class FamilBudgetApp(tk.Tk):
     def current_household_id(self):
         if self.household is None:
             return None
-        return int(self.household["id"])
+        return str(self.household["id"])
 
     def is_current_user_household_admin(self) -> bool:
         household_id = self.current_household_id()
@@ -542,7 +542,7 @@ class FamilBudgetApp(tk.Tk):
                 messagebox.showerror("Fejl", "E-mail eller password er forkert.")
                 return
             self.current_user = user
-            self.current_user_id = int(user["id"])
+            self.current_user_id = str(user["id"])
             self.user_name = user["full_name"]
             self.refresh_household_state()
             self.session_token = self.service.create_session(self.current_user_id)
@@ -624,7 +624,7 @@ class FamilBudgetApp(tk.Tk):
                 return
             user = self.service.get_user_by_id(user_id)
             self.current_user = user
-            self.current_user_id = int(user["id"])
+            self.current_user_id = str(user["id"])
             self.user_name = user["full_name"]
             self.refresh_household_state()
             self.session_token = self.service.create_session(self.current_user_id)
@@ -1333,7 +1333,7 @@ class FamilBudgetApp(tk.Tk):
 
         family_card = self.create_card(grid, "👨‍👩‍👧‍👦 Familieøkonomi")
         if self.household_member and self.household is not None:
-            summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            summary = self.service.get_household_financial_summary(str(self.household["id"]))
             for label, value, color in [
                 ("Saldo", self.format_currency(float(summary["balance"])), self.colors["primary"]),
                 ("Udgifter", self.format_currency(float(summary["expense"])), self.colors["danger"]),
@@ -1518,7 +1518,7 @@ class FamilBudgetApp(tk.Tk):
 
         household_summary = None
         if self.household_member and self.household is not None:
-            household_summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            household_summary = self.service.get_household_financial_summary(str(self.household["id"]))
             household_card = self.create_card(self.canvas_content, "Husstandsanalyse")
             household_card.pack(fill="x", padx=8, pady=(0, 8))
             tk.Label(household_card, text=f"Husstandens saldo: {self.format_currency(float(household_summary['balance']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
@@ -1766,7 +1766,7 @@ class FamilBudgetApp(tk.Tk):
                 card.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
 
         if self.household_member and self.household is not None:
-            household_summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            household_summary = self.service.get_household_financial_summary(str(self.household["id"]))
             household_card = self.create_card(self.canvas_content, "Familieanalyse")
             household_card.pack(fill="x", padx=8, pady=(0, 8))
             household_health = self.calculate_economic_health(
