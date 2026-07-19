@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from datetime import date, datetime
@@ -107,11 +108,6 @@ class LoginWindow(tk.Toplevel):
         self.password_var.set("")
         self.status_var.set("")
         self.build_body()
-        self.user_count = self.service.count_users()
-        self.full_name_var.set("")
-        self.email_var.set("")
-        self.password_var.set("")
-        self.build_body()
 
     def set_loading(self, loading: bool, message: str = ""):
         if not self.winfo_exists():
@@ -201,10 +197,21 @@ class FamilBudgetApp(tk.Tk):
         self.auth_frame = None
         self.top_bar = None
         self.nav_frame = None
+        self.sidebar_buttons = []
+        self.bottom_nav_buttons = []
         self.canvas_frame = None
         self.canvas = None
         self.canvas_content = None
         self.household = None
+        self.dashboard_cards = []
+        self._dashboard_data_cache = {"savings_goals": [], "subscriptions": [], "loaded_at": 0.0}
+        self._last_rendered_page = None
+        self._render_after_id = None
+        self._resize_after_id = None
+        self._session_timer_id = None
+        self._update_timer_id = None
+        self._notify_timer_id = None
+        self._last_resize_mode = None
 
         self.session_token = self.service.get_setting("session_token", "")
         if self.session_token:
@@ -223,9 +230,7 @@ class FamilBudgetApp(tk.Tk):
             self.load_transactions()
             self.load_notifications()
             self.show_page(self.current_page)
-            self.after(800, self.refresh_notifications)
-            self.after(1200, self.start_update_check)
-            self.after(5 * 60 * 1000, self.ensure_session_valid)
+            self.schedule_periodic_tasks()
 
     def get_setting(self, key, default):
         return self.service.get_setting(key, default)
@@ -233,14 +238,51 @@ class FamilBudgetApp(tk.Tk):
     def save_setting(self, key, value):
         self.service.save_setting(key, value)
 
+    def _perf_log(self, function_name: str, started_at: float):
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        print(f"[PERF] {function_name} {elapsed_ms:.2f} ms")
+
+    def cancel_scheduled_jobs(self):
+        for timer_id_attr in ("_render_after_id", "_resize_after_id", "_session_timer_id", "_update_timer_id", "_notify_timer_id"):
+            timer_id = getattr(self, timer_id_attr, None)
+            if timer_id is not None:
+                try:
+                    self.after_cancel(timer_id)
+                except tk.TclError:
+                    pass
+                setattr(self, timer_id_attr, None)
+
+    def schedule_periodic_tasks(self):
+        if self._notify_timer_id is not None:
+            try:
+                self.after_cancel(self._notify_timer_id)
+            except tk.TclError:
+                pass
+        if self._update_timer_id is not None:
+            try:
+                self.after_cancel(self._update_timer_id)
+            except tk.TclError:
+                pass
+        if self._session_timer_id is not None:
+            try:
+                self.after_cancel(self._session_timer_id)
+            except tk.TclError:
+                pass
+
+        self._notify_timer_id = self.after(800, self.refresh_notifications)
+        self._update_timer_id = self.after(1200, self.start_update_check)
+        self._session_timer_id = self.after(5 * 60 * 1000, self.ensure_session_valid)
+
     def ensure_session_valid(self):
+        started_at = time.perf_counter()
         if self.current_user and self.session_token:
             user = self.service.validate_session(self.session_token)
             if user is None:
                 messagebox.showwarning("Session udløbet", "Din session er udløbet. Log ind igen.")
                 self.logout()
                 return
-        self.after(5 * 60 * 1000, self.ensure_session_valid)
+        self._session_timer_id = self.after(5 * 60 * 1000, self.ensure_session_valid)
+        self._perf_log("ensure_session_valid", started_at)
 
     def on_auth_success(self, user, token):
         self.current_user = user
@@ -358,10 +400,8 @@ class FamilBudgetApp(tk.Tk):
         self.build_ui()
         self.load_transactions()
         self.load_notifications()
-        self.show_page(self.current_page)
-        self.after(800, self.refresh_notifications)
-        self.after(1200, self.start_update_check)
-        self.after(5 * 60 * 1000, self.ensure_session_valid)
+        self.show_page(self.current_page, force=True)
+        self.schedule_periodic_tasks()
  
     def build_login_form(self):
         self.clear_root()
@@ -556,6 +596,7 @@ class FamilBudgetApp(tk.Tk):
             self.bind_hover(btn, self.colors["surface"], self.colors["surface_2"])
             if page == self.current_page:
                 btn.configure(bg=self.colors["chip"], fg=self.colors["primary"])
+            self.sidebar_buttons.append(btn)
 
         self.sidebar.rowconfigure(len(nav_items), weight=1)
         self.sidebar_profile_frame = tk.Frame(self.sidebar, bg=self.colors["surface"], padx=16, pady=12)
@@ -608,7 +649,7 @@ class FamilBudgetApp(tk.Tk):
         self.canvas_window = self.canvas.create_window((0, 0), window=self.canvas_content, anchor="nw")
         self.canvas_content.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
-        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        self.canvas.bind("<MouseWheel>", self._on_mouse_wheel)
 
         self.fab = tk.Button(
             self.main_frame,
@@ -657,7 +698,12 @@ class FamilBudgetApp(tk.Tk):
             self.bottom_nav_buttons.append(btn)
 
         self.update_sidebar_profile()
-        self.on_resize()
+        self._apply_resize()
+
+    def _on_mouse_wheel(self, event):
+        if self.canvas is None:
+            return
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def bind_hover(self, widget, normal_bg, hover_bg):
         widget.bind("<Enter>", lambda e, bg=hover_bg: widget.configure(bg=bg))
@@ -712,21 +758,48 @@ class FamilBudgetApp(tk.Tk):
         for child in self.canvas_content.winfo_children():
             child.destroy()
 
-    def show_page(self, page):
+    def show_page(self, page, force=False):
+        started_at = time.perf_counter()
+        same_page = (page == self.current_page and self._last_rendered_page == page)
         self.current_page = page
         self.close_active_panel()
+        if same_page and not force:
+            self.update_nav_state()
+            self._perf_log("show_page", started_at)
+            return
+
+        if self._render_after_id is not None:
+            try:
+                self.after_cancel(self._render_after_id)
+            except tk.TclError:
+                pass
+            self._render_after_id = None
+
         self.clear_content()
-        self.show_skeleton()
-        self.after(350, self.render_page)
+        if page != "oversigt":
+            self.show_skeleton()
+        self._render_after_id = self.after(120, self.render_page)
         self.update_nav_state()
+        self._perf_log("show_page", started_at)
 
     def on_resize(self, event=None):
-        width = event.width if event is not None else self.winfo_width()
+        if self._resize_after_id is not None:
+            try:
+                self.after_cancel(self._resize_after_id)
+            except tk.TclError:
+                pass
+        self._resize_after_id = self.after(150, self._apply_resize)
+
+    def _apply_resize(self):
+        started_at = time.perf_counter()
+        self._resize_after_id = None
+        width = self.winfo_width()
         sidebar = getattr(self, "sidebar", None)
         bottom_nav = getattr(self, "bottom_nav", None)
         main_frame = getattr(self, "main_frame", None)
+        mode = "desktop" if width > 1000 else "mobile"
 
-        if width > 1000:
+        if mode == "desktop":
             if sidebar is not None and sidebar.winfo_exists() and not sidebar.winfo_ismapped():
                 sidebar.grid()
             if bottom_nav is not None and bottom_nav.winfo_exists() and bottom_nav.winfo_ismapped():
@@ -744,6 +817,11 @@ class FamilBudgetApp(tk.Tk):
                 main_frame.grid_configure(column=0)
             self.columnconfigure(0, weight=1)
             self.columnconfigure(1, weight=0)
+        self._last_resize_mode = mode
+
+        if self.current_page == "oversigt":
+            self.layout_dashboard_cards()
+        self._perf_log("_apply_resize", started_at)
 
     def show_skeleton(self):
         skeleton = tk.Frame(self.canvas_content, bg=self.colors["background"])
@@ -759,6 +837,8 @@ class FamilBudgetApp(tk.Tk):
             block.pack_propagate(False)
 
     def render_page(self):
+        started_at = time.perf_counter()
+        self._render_after_id = None
         self.clear_content()
         self.update_balance_display()
         if self.current_page == "oversigt":
@@ -771,21 +851,25 @@ class FamilBudgetApp(tk.Tk):
             self.render_household_page()
         elif self.current_page == "profil":
             self.render_profile_page()
+        self._last_rendered_page = self.current_page
+        self._perf_log("render_page", started_at)
 
     def update_nav_state(self):
-        for child in self.nav_frame.winfo_children():
-            if isinstance(child, tk.Button):
-                child.configure(bg=self.colors["surface"], fg=self.colors["text"])
-        for child in self.nav_frame.winfo_children():
-            if isinstance(child, tk.Button):
-                label = child.cget("text")
-                if label == self.page_label(self.current_page):
-                    child.configure(bg=self.colors["chip"], fg=self.colors["primary"])
+        started_at = time.perf_counter()
+        active_label = self.page_label(self.current_page)
+        for btn in getattr(self, "sidebar_buttons", []):
+            label = btn.cget("text")
+            if label == active_label:
+                btn.configure(bg=self.colors["chip"], fg=self.colors["primary"])
+            else:
+                btn.configure(bg=self.colors["surface"], fg=self.colors["text"])
 
         for btn in getattr(self, "bottom_nav_buttons", []):
-            btn.configure(bg=self.colors["surface"], fg=self.colors["text"])
             if getattr(btn, "page", None) == self.current_page:
                 btn.configure(bg=self.colors["chip"], fg=self.colors["primary"])
+            else:
+                btn.configure(bg=self.colors["surface"], fg=self.colors["text"])
+        self._perf_log("update_nav_state", started_at)
 
     def page_label(self, page):
         return {
@@ -797,13 +881,16 @@ class FamilBudgetApp(tk.Tk):
         }[page]
  
     def load_transactions(self):
+        started_at = time.perf_counter()
         try:
             self.transactions = self.service.load_transactions(self.current_user_id)
         except Exception as exc:
             messagebox.showerror("Fejl", f"Kunne ikke indlæse transaktioner: {exc}")
             self.transactions = []
+        self._perf_log("load_transactions", started_at)
 
     def load_notifications(self):
+        started_at = time.perf_counter()
         try:
             self.notifications = self.service.get_notifications(self.current_user_id)
             self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
@@ -813,6 +900,7 @@ class FamilBudgetApp(tk.Tk):
             self.notifications = []
             self.alert_count = 0
             self.update_notification_badge()
+        self._perf_log("load_notifications", started_at)
 
     def format_currency(self, value: float) -> str:
         return f"{value:,.2f} kr"
@@ -874,6 +962,31 @@ class FamilBudgetApp(tk.Tk):
                 col = idx % 2
                 card.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
 
+    def _load_dashboard_datasets(self):
+        started_at = time.perf_counter()
+        now = time.time()
+        cache_age = now - self._dashboard_data_cache["loaded_at"]
+        if cache_age <= 10.0:
+            self._perf_log("_load_dashboard_datasets_cached", started_at)
+            return self._dashboard_data_cache["savings_goals"], self._dashboard_data_cache["subscriptions"]
+
+        savings_goals = []
+        subscriptions = []
+        try:
+            savings_goals = self.service.get_savings_goals(self.current_user_id)
+        except Exception:
+            savings_goals = []
+        try:
+            subscriptions = self.service.get_subscriptions(self.current_user_id)
+        except Exception:
+            subscriptions = []
+
+        self._dashboard_data_cache["savings_goals"] = savings_goals
+        self._dashboard_data_cache["subscriptions"] = subscriptions
+        self._dashboard_data_cache["loaded_at"] = now
+        self._perf_log("_load_dashboard_datasets_db", started_at)
+        return savings_goals, subscriptions
+
     def update_notification_badge(self):
         if hasattr(self, "notification_button"):
             self.notification_button.configure(text=f"🔔 {self.alert_count}")
@@ -891,17 +1004,9 @@ class FamilBudgetApp(tk.Tk):
         return saldo
 
     def render_dashboard(self):
+        started_at = time.perf_counter()
         metrics = self.calculate_dashboard_metrics()
-        savings_goals = []
-        subscriptions = []
-        try:
-            savings_goals = self.service.get_savings_goals(self.current_user_id)
-        except Exception:
-            savings_goals = []
-        try:
-            subscriptions = self.service.get_subscriptions(self.current_user_id)
-        except Exception:
-            subscriptions = []
+        savings_goals, subscriptions = self._load_dashboard_datasets()
 
         header = tk.Frame(self.canvas_content, bg=self.colors["background"])
         header.pack(fill="x", padx=12, pady=(12, 12))
@@ -915,7 +1020,7 @@ class FamilBudgetApp(tk.Tk):
             ("Saldo", self.format_currency(metrics["balance"]), self.colors["primary"]),
             ("Indtægter i måned", self.format_currency(metrics["monthly_income"]), self.colors["success"]),
             ("Udgifter i måned", self.format_currency(metrics["monthly_expense"]), self.colors["danger"]),
-            ("Største kategori", f"{metrics["largest_category"]}", self.colors["text"]),
+            ("Største kategori", metrics["largest_category"], self.colors["text"]),
         ]:
             card = self.create_card(summary_row, title)
             card.configure(padx=12, pady=12)
@@ -979,6 +1084,7 @@ class FamilBudgetApp(tk.Tk):
 
         self.dashboard_cards = [ai_card, savings_card, latest_card, subscriptions_card]
         self.layout_dashboard_cards()
+        self._perf_log("render_dashboard", started_at)
 
     def render_budget_page(self):
         summary = self.create_card(self.canvas_content, "Budgetoversigt", "Se dine seneste transaktioner")
@@ -1335,22 +1441,28 @@ class FamilBudgetApp(tk.Tk):
                 self.load_transactions()
                 self.refresh_notifications()
                 self.close_active_panel()
-                self.show_page(self.current_page)
+                self.show_page(self.current_page, force=True)
 
             tk.Button(body, text="Gem", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=8, relief="flat", command=save).pack(pady=(16, 8))
 
         self.show_modal_panel("Tilføj transaktion", build_content, width=360)
 
     def refresh_notifications(self):
+        started_at = time.perf_counter()
         self.notifications = self.service.get_notifications(self.current_user_id)
         self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
         self.update_notification_badge()
-        self.service.save_notification(
-            self.current_user_id,
-            "Budget status",
-            "Din saldo er stabil og klar til næste uge",
-            "info",
-        )
+        now_ts = int(time.time())
+        last_status_ts = int(self.service.get_setting("last_budget_status_ts", "0") or "0")
+        if now_ts - last_status_ts >= 3600:
+            self.service.save_notification(
+                self.current_user_id,
+                "Budget status",
+                "Din saldo er stabil og klar til næste uge",
+                "info",
+            )
+            self.service.save_setting("last_budget_status_ts", str(now_ts))
+        self._perf_log("refresh_notifications", started_at)
 
     def save_notification(self, title, message, kind):
         self.service.save_notification(self.current_user_id, title, message, kind)
@@ -1372,6 +1484,7 @@ class FamilBudgetApp(tk.Tk):
         self.close_active_panel()
 
     def logout(self):
+        self.cancel_scheduled_jobs()
         if self.session_token:
             self.service.logout_user(self.session_token)
         self.service.save_setting("session_token", "")
@@ -1467,7 +1580,7 @@ class FamilBudgetApp(tk.Tk):
             self.build_ui()
             self.load_transactions()
             self.load_notifications()
-            self.show_page(self.current_page)
+            self.show_page(self.current_page, force=True)
         else:
             self.show_auth_screen()
 
