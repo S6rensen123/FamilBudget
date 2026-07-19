@@ -1,7 +1,9 @@
 import os
 import sys
+import math
 import threading
 import time
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from datetime import date, datetime
@@ -10,6 +12,11 @@ from database_service import DatabaseService
 from updater import parse_args, run_self_update
 from update_manager import UpdateManager
 from version import APP_VERSION
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
 class LoginWindow(tk.Toplevel):
@@ -215,6 +222,7 @@ class FamilBudgetApp(tk.Tk):
         self._update_timer_id = None
         self._notify_timer_id = None
         self._last_resize_mode = None
+        self._forecast_chart_image = None
 
         self.session_token = self.service.get_setting("session_token", "")
         if self.session_token:
@@ -304,6 +312,17 @@ class FamilBudgetApp(tk.Tk):
         else:
             self.household = None
             self.household_member = False
+
+    def current_household_id(self):
+        if self.household is None:
+            return None
+        return int(self.household["id"])
+
+    def is_current_user_household_admin(self) -> bool:
+        household_id = self.current_household_id()
+        if household_id is None or self.current_user_id is None:
+            return False
+        return self.service.is_household_admin(household_id, self.current_user_id)
 
     def update_sidebar_profile(self):
         if hasattr(self, "sidebar_user_label"):
@@ -577,9 +596,15 @@ class FamilBudgetApp(tk.Tk):
 
         nav_items = [
             ("🏠 Oversigt", "oversigt"),
-            ("💰 Budget", "budget"),
+            ("💳 Transaktioner", "transaktioner"),
+            ("📊 Budgetanalyse", "budgetanalyse"),
+            ("🔄 Abonnementer", "abonnementer"),
+            ("🎯 Opsparing", "opsparing"),
             ("📅 Kalender", "kalender"),
             ("👨‍👩‍👧‍👦 Husstand", "husstand"),
+            ("💰 Børnepenge", "boernepenge"),
+            ("🤖 AI Rådgiver", "ai"),
+            ("🔔 Notifikationer", "notifikationer"),
             ("👤 Profil", "profil"),
         ]
         for i, (label, page) in enumerate(nav_items):
@@ -674,15 +699,14 @@ class FamilBudgetApp(tk.Tk):
         self.bottom_nav.columnconfigure(1, weight=1)
         self.bottom_nav.columnconfigure(2, weight=1)
         self.bottom_nav.columnconfigure(3, weight=1)
-        self.bottom_nav.columnconfigure(4, weight=1)
 
         self.bottom_nav_buttons = []
         nav_items = [
             ("🏠", "oversigt"),
-            ("💰", "budget"),
+            ("💳", "transaktioner"),
+            ("🔄", "abonnementer"),
             ("📅", "kalender"),
             ("👨‍👩‍👧‍👦", "husstand"),
-            ("👤", "profil"),
         ]
         for idx, (icon, page) in enumerate(nav_items):
             btn = tk.Button(
@@ -846,12 +870,24 @@ class FamilBudgetApp(tk.Tk):
         self.update_balance_display()
         if self.current_page == "oversigt":
             self.render_dashboard()
-        elif self.current_page == "budget":
-            self.render_budget_page()
+        elif self.current_page == "transaktioner":
+            self.render_transactions_page()
+        elif self.current_page == "budgetanalyse":
+            self.render_budget_analysis_page()
+        elif self.current_page == "abonnementer":
+            self.render_subscriptions_page()
+        elif self.current_page == "opsparing":
+            self.render_savings_page()
         elif self.current_page == "kalender":
             self.render_calendar_page()
         elif self.current_page == "husstand":
             self.render_household_page()
+        elif self.current_page == "boernepenge":
+            self.render_children_money_page()
+        elif self.current_page == "ai":
+            self.render_ai_advisor_page()
+        elif self.current_page == "notifikationer":
+            self.render_notifications_page()
         elif self.current_page == "profil":
             self.render_profile_page()
         self._last_rendered_page = self.current_page
@@ -877,9 +913,15 @@ class FamilBudgetApp(tk.Tk):
     def page_label(self, page):
         return {
             "oversigt": "Oversigt",
-            "budget": "Budget",
+            "transaktioner": "Transaktioner",
+            "budgetanalyse": "Budgetanalyse",
+            "abonnementer": "Abonnementer",
+            "opsparing": "Opsparing",
             "kalender": "Kalender",
             "husstand": "Husstand",
+            "boernepenge": "Børnepenge",
+            "ai": "AI Rådgiver",
+            "notifikationer": "Notifikationer",
             "profil": "Profil",
         }[page]
  
@@ -895,9 +937,10 @@ class FamilBudgetApp(tk.Tk):
             try:
                 rows = self.service.load_transactions(user_id)
             except Exception as exc:
+                error_text = f"Kunne ikke indlæse transaktioner: {exc}"
                 def on_error():
                     self._transactions_loading = False
-                    messagebox.showerror("Fejl", f"Kunne ikke indlæse transaktioner: {exc}")
+                    messagebox.showerror("Fejl", error_text)
                     self.transactions = []
                     if callback is not None:
                         callback()
@@ -909,7 +952,7 @@ class FamilBudgetApp(tk.Tk):
                 self.transactions = rows
                 if callback is not None:
                     callback()
-                elif self.current_page in ("oversigt", "budget"):
+                elif self.current_page in ("oversigt", "transaktioner", "budgetanalyse", "husstand", "ai", "boernepenge"):
                     self.show_page(self.current_page, force=True)
 
             self.after(0, on_success)
@@ -930,9 +973,10 @@ class FamilBudgetApp(tk.Tk):
             try:
                 rows = self.service.get_notifications(user_id)
             except Exception as exc:
+                error_text = f"Kunne ikke indlæse notifikationer: {exc}"
                 def on_error():
                     self._notifications_loading = False
-                    messagebox.showerror("Fejl", f"Kunne ikke indlæse notifikationer: {exc}")
+                    messagebox.showerror("Fejl", error_text)
                     self.notifications = []
                     self.alert_count = 0
                     self.update_notification_badge()
@@ -1072,90 +1116,351 @@ class FamilBudgetApp(tk.Tk):
         self.current_balance = saldo
         return saldo
 
+    def calculate_economic_health(self, balance: float, monthly_income: float, monthly_expense: float, savings_total: float, subscriptions_total: float) -> int:
+        if monthly_income <= 0:
+            return 25
+        savings_rate = max(0.0, min(1.0, savings_total / max(monthly_income, 1.0)))
+        expense_rate = max(0.0, min(1.0, monthly_expense / max(monthly_income, 1.0)))
+        subscription_rate = max(0.0, min(1.0, subscriptions_total / max(monthly_income, 1.0)))
+        balance_bonus = 0.15 if balance > 0 else 0.0
+        score = (0.55 * (1.0 - expense_rate)) + (0.25 * savings_rate) + (0.20 * (1.0 - subscription_rate)) + balance_bonus
+        return int(max(0, min(100, round(score * 100))))
+
+    def compute_balance_forecast(self, months: int = 12):
+        monthly_net = {}
+        for row in self.transactions:
+            try:
+                d = datetime.fromisoformat(str(row["dato"]))
+            except Exception:
+                continue
+            key = (d.year, d.month)
+            if key not in monthly_net:
+                monthly_net[key] = 0.0
+            amount = float(row["beloeb"])
+            if row["type"] == "Indtægt":
+                monthly_net[key] += amount
+            else:
+                monthly_net[key] -= amount
+        avg_net = sum(monthly_net.values()) / len(monthly_net) if monthly_net else 0.0
+        start_balance = self.get_balance()
+        labels = []
+        values = []
+        cur = datetime.now()
+        running = start_balance
+        for idx in range(months):
+            month = ((cur.month - 1 + idx) % 12) + 1
+            year = cur.year + ((cur.month - 1 + idx) // 12)
+            labels.append(f"{month:02d}/{str(year)[-2:]}")
+            running += avg_net
+            values.append(running)
+        return labels, values
+
+    def render_health_ring(self, parent, score: int):
+        canvas = tk.Canvas(parent, width=120, height=120, bg=self.colors["surface"], highlightthickness=0)
+        canvas.pack(padx=8, pady=8)
+        canvas.create_oval(10, 10, 110, 110, outline=self.colors["border"], width=10)
+        extent = int(360 * (score / 100.0))
+        color = self.colors["success"] if score >= 70 else (self.colors["warning"] if score >= 45 else self.colors["danger"])
+        canvas.create_arc(10, 10, 110, 110, start=90, extent=-extent, style="arc", outline=color, width=10)
+        canvas.create_text(60, 60, text=str(score), fill=self.colors["text"], font=("Segoe UI", 16, "bold"))
+
+    def render_forecast_chart(self, parent):
+        card = self.create_card(parent, "📈 Forventet saldo (12 måneder)")
+        labels, values = self.compute_balance_forecast(12)
+        if plt is None:
+            tk.Label(card, text="matplotlib er ikke installeret.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=8)
+            return card
+
+        try:
+            figure = plt.figure(figsize=(7.2, 2.4), dpi=100)
+            axis = figure.add_subplot(111)
+            axis.plot(labels, values, color="#3B82F6", linewidth=2.2)
+            axis.fill_between(labels, values, alpha=0.10, color="#3B82F6")
+            axis.grid(alpha=0.2)
+            axis.tick_params(axis="x", rotation=35, labelsize=8)
+            axis.tick_params(axis="y", labelsize=8)
+            tmp_path = os.path.join(tempfile.gettempdir(), "familbudget_forecast.png")
+            figure.tight_layout()
+            figure.savefig(tmp_path)
+            plt.close(figure)
+            self._forecast_chart_image = tk.PhotoImage(file=tmp_path)
+            tk.Label(card, image=self._forecast_chart_image, bg=self.colors["surface"]).pack(fill="x", padx=8, pady=(0, 8))
+        except Exception as exc:
+            tk.Label(card, text=f"Kunne ikke generere graf: {exc}", bg=self.colors["surface"], fg=self.colors["danger"]).pack(anchor="w", padx=16, pady=8)
+        return card
+
     def render_dashboard(self):
         started_at = time.perf_counter()
         metrics = self.calculate_dashboard_metrics()
         savings_goals, subscriptions = self._load_dashboard_datasets()
 
+        monthly_income = float(metrics["monthly_income"])
+        monthly_expense = float(metrics["monthly_expense"])
+        monthly_surplus = monthly_income - monthly_expense
+        disposable = monthly_income - monthly_expense
+        savings_total = sum(float(goal["current_amount"]) for goal in savings_goals) if savings_goals else 0.0
+        subscriptions_total = sum(float(sub["amount"]) for sub in subscriptions if sub["active"] == 1) if subscriptions else 0.0
+        health_score = self.calculate_economic_health(metrics["balance"], monthly_income, monthly_expense, savings_total, subscriptions_total)
+
         header = tk.Frame(self.canvas_content, bg=self.colors["background"])
-        header.pack(fill="x", padx=12, pady=(12, 12))
+        header.pack(fill="x", padx=8, pady=(8, 8))
+        tk.Label(header, text=f"Hej {self.user_name}", font=("Segoe UI", 20, "bold"), bg=self.colors["background"], fg=self.colors["text"]).pack(anchor="w")
 
-        tk.Label(header, text=f"Hej {self.user_name} 👋", font=("Segoe UI", 24, "bold"), bg=self.colors["background"], fg=self.colors["text"]).pack(anchor="w")
-        tk.Label(header, text="Her er din økonomi for den aktuelle periode.", font=("Segoe UI", 12), bg=self.colors["background"], fg=self.colors["muted"]).pack(anchor="w")
-
-        summary_row = tk.Frame(self.canvas_content, bg=self.colors["background"])
-        summary_row.pack(fill="x", padx=12, pady=(0, 12))
+        top_row = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        top_row.pack(fill="x", padx=8, pady=(0, 8))
         for title, value, color in [
-            ("Saldo", self.format_currency(metrics["balance"]), self.colors["primary"]),
-            ("Indtægter i måned", self.format_currency(metrics["monthly_income"]), self.colors["success"]),
-            ("Udgifter i måned", self.format_currency(metrics["monthly_expense"]), self.colors["danger"]),
-            ("Største kategori", metrics["largest_category"], self.colors["text"]),
+            ("Samlet saldo", self.format_currency(metrics["balance"]), self.colors["primary"]),
+            ("Indtægter (måned)", self.format_currency(monthly_income), self.colors["success"]),
+            ("Udgifter (måned)", self.format_currency(monthly_expense), self.colors["danger"]),
+            ("Overskud (måned)", self.format_currency(monthly_surplus), self.colors["text"]),
         ]:
-            card = self.create_card(summary_row, title)
-            card.configure(padx=12, pady=12)
+            card = self.create_card(top_row, title)
             card.pack(side="left", fill="both", expand=True, padx=4)
-            tk.Label(card, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(8, 0))
+            tk.Label(card, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16, pady=(2, 10))
 
-        dashboard_grid = tk.Frame(self.canvas_content, bg=self.colors["background"])
-        dashboard_grid.pack(fill="both", expand=True, padx=12, pady=8)
-        dashboard_grid.columnconfigure(0, weight=1)
-        dashboard_grid.columnconfigure(1, weight=1)
+        second_row = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        second_row.pack(fill="x", padx=8, pady=(0, 8))
 
-        ai_card = self.create_card(dashboard_grid, "🤖 AI-indsigt")
-        insight_lines = [
-            f"Største udgiftskategori: {metrics['largest_category']}",
-            f"Udgifter denne måned: {self.format_currency(metrics['monthly_expense'])}",
-            f"Indtægter denne måned: {self.format_currency(metrics['monthly_income'])}",
-            f"Aktuel saldo: {self.format_currency(metrics['balance'])}",
-        ]
-        if metrics["biggest_transaction"]:
-            biggest = metrics["biggest_transaction"]
-            insight_lines.append(f"Største transaktion: {biggest['kategori']} {self.format_currency(biggest['amount'])}")
+        disposable_card = self.create_card(second_row, "Rådighedsbeløb")
+        disposable_card.pack(side="left", fill="both", expand=True, padx=4)
+        tk.Label(disposable_card, text=self.format_currency(disposable), bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16, pady=(2, 10))
 
-        for line in insight_lines:
-            tk.Label(ai_card, text=line, bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=15, pady=4)
+        savings_card = self.create_card(second_row, "Opsparing")
+        savings_card.pack(side="left", fill="both", expand=True, padx=4)
+        tk.Label(savings_card, text=self.format_currency(savings_total), bg=self.colors["surface"], fg=self.colors["success"], font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16, pady=(2, 10))
 
-        savings_card = self.create_card(dashboard_grid, "🎯 Opsparingsmål")
-        if savings_goals:
-            for goal in savings_goals[:3]:
-                progress = 0.0
-                if goal["target_amount"]:
-                    progress = min(100.0, (float(goal["current_amount"]) / float(goal["target_amount"]) * 100.0) if goal["target_amount"] else 0.0)
-                row = tk.Frame(savings_card, bg=self.colors["surface"])
-                row.pack(fill="x", padx=15, pady=8)
-                tk.Label(row, text=goal["title"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
-                tk.Label(row, text=f"{self.format_currency(goal['current_amount'])} / {self.format_currency(goal['target_amount'])} ({progress:.0f} %)", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+        health_card = self.create_card(second_row, "Økonomisk sundhed")
+        health_card.pack(side="left", fill="both", expand=True, padx=4)
+        self.render_health_ring(health_card, health_score)
+
+        grid = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        grid.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        family_card = self.create_card(grid, "👨‍👩‍👧‍👦 Familieøkonomi")
+        if self.household_member and self.household is not None:
+            summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            for label, value, color in [
+                ("Saldo", self.format_currency(float(summary["balance"])), self.colors["primary"]),
+                ("Udgifter", self.format_currency(float(summary["expense"])), self.colors["danger"]),
+                ("Indtægter", self.format_currency(float(summary["income"])), self.colors["success"]),
+                ("Medlemsantal", str(summary["member_count"]), self.colors["text"]),
+            ]:
+                row = tk.Frame(family_card, bg=self.colors["surface"])
+                row.pack(fill="x", padx=14, pady=3)
+                tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+                tk.Label(row, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 10, "bold")).pack(side="right")
         else:
-            tk.Label(savings_card, text="Ingen opsparingsmål endnu.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=15, pady=15)
+            tk.Label(family_card, text="Ingen husstand tilknyttet.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=10)
 
-        latest_card = self.create_card(dashboard_grid, "🧾 Seneste transaktioner")
-        recent = self.transactions[:5]
-        if recent:
-            for transaction in recent:
-                row = tk.Frame(latest_card, bg=self.colors["surface"])
-                row.pack(fill="x", padx=15, pady=6)
-                tk.Label(row, text=transaction["kategori"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(side="left")
-                tk.Label(row, text=self.format_currency(float(transaction["beloeb"])), bg=self.colors["surface"], fg=self.colors["success"] if transaction["type"] == "Indtægt" else self.colors["danger"]).pack(side="right")
-                tk.Label(row, text=transaction["dato"], bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
-        else:
-            tk.Label(latest_card, text="Ingen transaktioner endnu.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=15, pady=15)
+        ai_card = self.create_card(grid, "🤖 Hurtig indsigt")
+        tk.Label(ai_card, text=f"Største kategori: {metrics['largest_category']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(ai_card, text=f"Abonnementer/måned: {self.format_currency(subscriptions_total)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(ai_card, text=f"Mulig opsparing: {self.format_currency(max(0.0, subscriptions_total * 0.25))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
 
-        subscriptions_card = self.create_card(dashboard_grid, "📦 Aktive abonnementer")
-        active_subs = [sub for sub in subscriptions if sub["active"] == 1]
-        if active_subs:
-            for sub in active_subs[:3]:
-                row = tk.Frame(subscriptions_card, bg=self.colors["surface"])
-                row.pack(fill="x", padx=15, pady=8)
-                tk.Label(row, text=sub["name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
-                tk.Label(row, text=f"{self.format_currency(float(sub['amount']))} - {sub.get('billing_date', 'Ingen dato')}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
-        else:
-            tk.Label(subscriptions_card, text="Ingen aktive abonnementer.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=15, pady=15)
+        chart_card = self.render_forecast_chart(grid)
 
-        self.dashboard_cards = [ai_card, savings_card, latest_card, subscriptions_card]
+        recent_card = self.create_card(grid, "💳 Seneste transaktioner")
+        for row in self.transactions[:6]:
+            r = tk.Frame(recent_card, bg=self.colors["surface"])
+            r.pack(fill="x", padx=14, pady=4)
+            amount_color = self.colors["success"] if row["type"] == "Indtægt" else self.colors["danger"]
+            tk.Label(r, text=row["kategori"], bg=self.colors["surface"], fg=self.colors["text"]).pack(side="left")
+            tk.Label(r, text=self.format_currency(float(row["beloeb"])), bg=self.colors["surface"], fg=amount_color, font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        self.dashboard_cards = [family_card, ai_card, chart_card, recent_card]
         self.layout_dashboard_cards()
         self._perf_log("render_dashboard", started_at)
 
-    def render_budget_page(self):
+    def analyze_budget_categories(self):
+        now = datetime.now()
+        current_key = (now.year, now.month)
+        prev_month = 12 if now.month == 1 else now.month - 1
+        prev_year = now.year - 1 if now.month == 1 else now.year
+        prev_key = (prev_year, prev_month)
+
+        totals = {}
+        current_month = {}
+        previous_month = {}
+
+        for row in self.transactions:
+            if row["type"] == "Indtægt":
+                continue
+            category = row["kategori"]
+            amount = float(row["beloeb"])
+            totals[category] = totals.get(category, 0.0) + amount
+            try:
+                d = datetime.fromisoformat(str(row["dato"]))
+            except Exception:
+                continue
+            key = (d.year, d.month)
+            if key == current_key:
+                current_month[category] = current_month.get(category, 0.0) + amount
+            elif key == prev_key:
+                previous_month[category] = previous_month.get(category, 0.0) + amount
+
+        top_categories = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:10]
+        largest_category = top_categories[0][0] if top_categories else "Ingen kategori"
+        smallest_category = top_categories[-1][0] if top_categories else "Ingen kategori"
+
+        growth = {}
+        all_categories = set(current_month.keys()) | set(previous_month.keys())
+        for cat in all_categories:
+            growth[cat] = current_month.get(cat, 0.0) - previous_month.get(cat, 0.0)
+
+        most_growing = max(growth.items(), key=lambda item: item[1])[0] if growth else "Ingen kategori"
+        most_falling = min(growth.items(), key=lambda item: item[1])[0] if growth else "Ingen kategori"
+
+        return {
+            "largest_category": largest_category,
+            "smallest_category": smallest_category,
+            "most_growing": most_growing,
+            "most_falling": most_falling,
+            "top_categories": top_categories,
+            "growth": growth,
+        }
+
+    def estimate_goal_target_date(self, missing_amount: float, monthly_surplus: float) -> str:
+        if missing_amount <= 0:
+            return "Mål opnået"
+        if monthly_surplus <= 0:
+            return "Ukendt"
+        months_needed = int(math.ceil(missing_amount / monthly_surplus))
+        now = datetime.now()
+        month = ((now.month - 1 + months_needed) % 12) + 1
+        year = now.year + ((now.month - 1 + months_needed) // 12)
+        return f"{month:02d}/{year}"
+
+    def build_budget_ai_insights(
+        self,
+        category_analysis: dict,
+        monthly_income: float,
+        monthly_expense: float,
+        subscriptions_total: float,
+        savings_missing: float,
+        household_summary: dict = None,
+    ):
+        insights = []
+        insights.append(f"{category_analysis['largest_category']} er din største kategori.")
+        if monthly_income > 0:
+            overspend_pct = (monthly_expense / monthly_income) * 100.0
+            insights.append(f"Du bruger {overspend_pct:.0f}% af din månedlige indtægt.")
+        insights.append(f"Du bruger {self.format_currency(subscriptions_total)} pr. måned på abonnementer.")
+        insights.append(f"Potentiel besparelse: {self.format_currency(subscriptions_total * 0.30)} pr. måned.")
+        if savings_missing > 0:
+            insights.append(f"Du mangler {self.format_currency(savings_missing)} for at nå dine opsparingsmål.")
+        if household_summary is not None:
+            insights.append(
+                f"Husstanden har saldo {self.format_currency(float(household_summary['balance']))} "
+                f"og udgifter {self.format_currency(float(household_summary['expense']))}."
+            )
+        return insights
+
+    def render_budget_analysis_page(self):
+        started_at = time.perf_counter()
+        metrics = self.calculate_dashboard_metrics()
+        savings_goals, subscriptions = self._load_dashboard_datasets()
+        category_analysis = self.analyze_budget_categories()
+
+        monthly_income = float(metrics["monthly_income"])
+        monthly_expense = float(metrics["monthly_expense"])
+        monthly_surplus = monthly_income - monthly_expense
+        balance = float(metrics["balance"])
+        subscriptions_total = sum(float(sub["amount"]) for sub in subscriptions if sub["active"] == 1)
+        savings_total = sum(float(goal["current_amount"]) for goal in savings_goals) if savings_goals else 0.0
+        savings_target_total = sum(float(goal["target_amount"]) for goal in savings_goals) if savings_goals else 0.0
+        savings_missing = max(0.0, savings_target_total - savings_total)
+        expensive_sub = max((sub for sub in subscriptions if sub["active"] == 1), key=lambda s: float(s["amount"]), default=None)
+        health_score = self.calculate_economic_health(balance, monthly_income, monthly_expense, savings_total, subscriptions_total)
+
+        header = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        header.pack(fill="x", padx=8, pady=(8, 8))
+        tk.Label(header, text="📊 Budgetanalyse", bg=self.colors["background"], fg=self.colors["text"], font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Avanceret analyse af privat- og husstandsøkonomi", bg=self.colors["background"], fg=self.colors["muted"]).pack(anchor="w")
+
+        overview = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        overview.pack(fill="x", padx=8, pady=(0, 8))
+        for title, value, color in [
+            ("Samlet saldo", self.format_currency(balance), self.colors["primary"]),
+            ("Månedlige indtægter", self.format_currency(monthly_income), self.colors["success"]),
+            ("Månedlige udgifter", self.format_currency(monthly_expense), self.colors["danger"]),
+            ("Månedligt overskud", self.format_currency(monthly_surplus), self.colors["text"]),
+        ]:
+            card = self.create_card(overview, title)
+            card.pack(side="left", fill="both", expand=True, padx=4)
+            tk.Label(card, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16, pady=(2, 10))
+
+        grid = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        grid.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        category_card = self.create_card(grid, "Kategorianalyse")
+        tk.Label(category_card, text=f"Største: {category_analysis['largest_category']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(category_card, text=f"Mindste: {category_analysis['smallest_category']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(category_card, text=f"Mest voksende: {category_analysis['most_growing']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(category_card, text=f"Mest faldende: {category_analysis['most_falling']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(category_card, text="Top 10 kategorier:", bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=14, pady=(8, 2))
+        for category, amount in category_analysis["top_categories"]:
+            tk.Label(category_card, text=f"• {category}: {self.format_currency(amount)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=1)
+
+        subscriptions_card = self.create_card(grid, "Abonnementsanalyse")
+        tk.Label(subscriptions_card, text=f"Du bruger {self.format_currency(subscriptions_total)} / md på abonnementer.", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(subscriptions_card, text=f"Antal abonnementer: {len([s for s in subscriptions if s['active'] == 1])}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        if expensive_sub is not None:
+            tk.Label(subscriptions_card, text=f"Dyreste abonnement: {expensive_sub['name']} ({self.format_currency(float(expensive_sub['amount']))})", bg=self.colors["surface"], fg=self.colors["warning"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(subscriptions_card, text=f"Potentiel besparelse: {self.format_currency(subscriptions_total * 0.30)} / md", bg=self.colors["surface"], fg=self.colors["success"]).pack(anchor="w", padx=14, pady=3)
+
+        savings_card = self.create_card(grid, "Opsparingsanalyse")
+        tk.Label(savings_card, text=f"Samlet opsparing: {self.format_currency(savings_total)}", bg=self.colors["surface"], fg=self.colors["success"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(savings_card, text=f"Aktive mål: {len(savings_goals)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(savings_card, text=f"Manglende beløb: {self.format_currency(savings_missing)}", bg=self.colors["surface"], fg=self.colors["danger"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(savings_card, text=f"Forventet måldato: {self.estimate_goal_target_date(savings_missing, monthly_surplus)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+
+        health_card = self.create_card(grid, "Økonomisk sundhed")
+        self.render_health_ring(health_card, health_score)
+        color_text = self.colors["success"] if health_score >= 70 else (self.colors["warning"] if health_score >= 40 else self.colors["danger"])
+        tk.Label(health_card, text=f"Score: {health_score}/100", bg=self.colors["surface"], fg=color_text, font=("Segoe UI", 12, "bold")).pack(anchor="center", pady=(0, 8))
+
+        household_summary = None
+        if self.household_member and self.household is not None:
+            household_summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            household_card = self.create_card(self.canvas_content, "Husstandsanalyse")
+            household_card.pack(fill="x", padx=8, pady=(0, 8))
+            tk.Label(household_card, text=f"Husstandens saldo: {self.format_currency(float(household_summary['balance']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"Husstandens indtægter: {self.format_currency(float(household_summary['income']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"Husstandens udgifter: {self.format_currency(float(household_summary['expense']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"Husstandens abonnementer: {self.format_currency(float(household_summary['subscriptions']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"Privat vs husstand saldo: {self.format_currency(balance)} vs {self.format_currency(float(household_summary['balance']))}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=14, pady=3)
+
+        forecast_card = self.render_forecast_chart(self.canvas_content)
+        forecast_card.pack(fill="x", padx=8, pady=(0, 8))
+
+        ai_card = self.create_card(self.canvas_content, "AI Budgetanalyse")
+        ai_card.pack(fill="x", padx=8, pady=(0, 8))
+        insights = self.build_budget_ai_insights(
+            category_analysis=category_analysis,
+            monthly_income=monthly_income,
+            monthly_expense=monthly_expense,
+            subscriptions_total=subscriptions_total,
+            savings_missing=savings_missing,
+            household_summary=household_summary,
+        )
+        for insight in insights:
+            tk.Label(ai_card, text=f"• {insight}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=2)
+
+        cards = [category_card, subscriptions_card, savings_card, health_card]
+        one_column = self.winfo_width() <= 1000
+        for idx, card in enumerate(cards):
+            if one_column:
+                card.grid(row=idx, column=0, sticky="nsew", padx=5, pady=5, columnspan=2)
+            else:
+                card.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=5, pady=5)
+
+        self._perf_log("render_budget_analysis_page", started_at)
+
+    def render_transactions_page(self):
         summary = self.create_card(self.canvas_content, "Budgetoversigt", "Se dine seneste transaktioner")
         summary.pack(fill="x", padx=8, pady=(8, 8))
         tk.Label(summary, text=f"Indtægter: {self.get_income():,.2f} kr", bg=self.colors["surface"], fg=self.colors["success"]).pack(anchor="w", padx=16, pady=4)
@@ -1170,18 +1475,223 @@ class FamilBudgetApp(tk.Tk):
 
         table_card = self.create_card(self.canvas_content, "Transaktioner", "Alle poster er tilgængelige i realtid")
         table_card.pack(fill="x", padx=8, pady=(0, 8))
-        columns = ("ID", "Dato", "Kategori", "Beløb", "Type")
+        columns = ("ID", "Dato", "Kategori", "Beløb", "Type", "Scope")
         tree = ttk.Treeview(table_card, columns=columns, show="headings", height=8)
         tree.pack(fill="both", padx=12, pady=12)
         for col in columns:
             tree.heading(col, text=col)
             tree.column(col, width=90, anchor="w")
         for row in self.transactions:
+            scope = "Husstand" if "household_id" in row.keys() and row["household_id"] else "Privat"
             tree.insert(
                 "",
                 tk.END,
-                values=(row["id"], row["dato"], row["kategori"], row["beloeb"], row["type"]),
+                values=(row["id"], row["dato"], row["kategori"], row["beloeb"], row["type"], scope),
             )
+
+    def render_subscriptions_page(self):
+        card = self.create_card(self.canvas_content, "Abonnementer", "Overblik over dine aktive abonnementer")
+        card.pack(fill="x", padx=8, pady=(8, 8))
+        _, subscriptions = self._load_dashboard_datasets()
+        active_subs = [sub for sub in subscriptions if sub["active"] == 1]
+        monthly_total = sum(float(sub["amount"]) for sub in active_subs)
+        tk.Label(card, text=f"Månedlig abonnementsudgift: {self.format_currency(monthly_total)}", bg=self.colors["surface"], fg=self.colors["warning"], font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=16, pady=(8, 10))
+
+        action_row = tk.Frame(card, bg=self.colors["surface"])
+        action_row.pack(fill="x", padx=16, pady=(0, 10))
+        tk.Button(
+            action_row,
+            text="Tilføj abonnement",
+            bg=self.colors["primary"],
+            fg="white",
+            bd=0,
+            padx=10,
+            pady=8,
+            relief="flat",
+            command=self.open_subscription_form,
+        ).pack(side="left")
+
+        if not subscriptions:
+            tk.Label(card, text="Ingen abonnementer fundet.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=(0, 10))
+            return
+
+        for sub in subscriptions[:12]:
+            row = tk.Frame(card, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=4)
+            billing_date = sub["billing_date"] if "billing_date" in sub.keys() and sub["billing_date"] else "Ingen dato"
+            status = "Aktiv" if sub["active"] == 1 else "Inaktiv"
+            info = tk.Frame(row, bg=self.colors["surface"])
+            info.pack(side="left", fill="x", expand=True)
+            tk.Label(info, text=sub["name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            scope = "Husstand" if "household_id" in sub.keys() and sub["household_id"] else "Privat"
+            tk.Label(info, text=f"{self.format_currency(float(sub['amount']))} • {billing_date} • {status} • {scope}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+
+            actions = tk.Frame(row, bg=self.colors["surface"])
+            actions.pack(side="right")
+            tk.Button(actions, text="Rediger", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=6, relief="flat", command=lambda s=sub: self.open_subscription_form(s)).pack(side="left", padx=3)
+            tk.Button(actions, text="Slet", bg=self.colors["danger"], fg="white", bd=0, padx=8, pady=6, relief="flat", command=lambda sid=sub["id"]: self.delete_subscription(sid)).pack(side="left", padx=3)
+
+    def render_savings_page(self):
+        card = self.create_card(self.canvas_content, "Opsparing", "Dine opsparingsmål og fremdrift")
+        card.pack(fill="x", padx=8, pady=(8, 8))
+        savings_goals, _ = self._load_dashboard_datasets()
+
+        action_row = tk.Frame(card, bg=self.colors["surface"])
+        action_row.pack(fill="x", padx=16, pady=(0, 10))
+        tk.Button(
+            action_row,
+            text="Tilføj mål",
+            bg=self.colors["primary"],
+            fg="white",
+            bd=0,
+            padx=10,
+            pady=8,
+            relief="flat",
+            command=self.open_savings_goal_form,
+        ).pack(side="left")
+
+        if not savings_goals:
+            tk.Label(card, text="Ingen opsparingsmål endnu.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=10)
+            return
+
+        for goal in savings_goals[:12]:
+            target = float(goal["target_amount"]) if goal["target_amount"] else 0.0
+            current = float(goal["current_amount"]) if goal["current_amount"] else 0.0
+            progress = 0.0 if target <= 0 else min(100.0, (current / target) * 100.0)
+            row = tk.Frame(card, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=6)
+            info = tk.Frame(row, bg=self.colors["surface"])
+            info.pack(side="left", fill="both", expand=True)
+            tk.Label(info, text=goal["title"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            scope = "Husstand" if "household_id" in goal.keys() and goal["household_id"] else "Privat"
+            tk.Label(info, text=scope, bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+            bar_bg = tk.Frame(info, bg=self.colors["border"], height=8)
+            bar_bg.pack(fill="x", pady=4)
+            bar_fill = tk.Frame(bar_bg, bg=self.colors["success"], height=8, width=max(1, int(progress * 3)))
+            bar_fill.pack(side="left", fill="y")
+            tk.Label(info, text=f"{self.format_currency(current)} / {self.format_currency(target)} ({progress:.0f}%)", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+
+            actions = tk.Frame(row, bg=self.colors["surface"])
+            actions.pack(side="right")
+            tk.Button(actions, text="Rediger", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=6, relief="flat", command=lambda g=goal: self.open_savings_goal_form(g)).pack(side="left", padx=3)
+            tk.Button(actions, text="Slet", bg=self.colors["danger"], fg="white", bd=0, padx=8, pady=6, relief="flat", command=lambda gid=goal["id"]: self.delete_savings_goal(gid)).pack(side="left", padx=3)
+
+    def render_children_money_page(self):
+        card = self.create_card(self.canvas_content, "Børnepenge", "Planlægning af børnerelateret økonomi")
+        card.pack(fill="x", padx=8, pady=(8, 8))
+        tk.Label(card, text="Tip: opret kategorier som 'Børnepenge', 'Skole' og 'Fritid' under transaktioner for bedre overblik.", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=16, pady=10)
+
+    def render_notifications_page(self):
+        card = self.create_card(self.canvas_content, "Notifikationer", "Seneste opdateringer")
+        card.pack(fill="x", padx=8, pady=(8, 8))
+        if not self.notifications:
+            tk.Label(card, text="Ingen notifikationer endnu.", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=10)
+            return
+        for notification in self.notifications:
+            row = tk.Frame(card, bg=self.colors["surface_2"], highlightthickness=1, highlightbackground=self.colors["border"])
+            row.pack(fill="x", padx=16, pady=4)
+            tk.Label(row, text=notification["title"], bg=self.colors["surface_2"], fg=self.colors["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+            tk.Label(row, text=notification["message"], bg=self.colors["surface_2"], fg=self.colors["muted"]).pack(anchor="w", padx=10, pady=(0, 8))
+
+    def render_ai_advisor_page(self):
+        started_at = time.perf_counter()
+        metrics = self.calculate_dashboard_metrics()
+        savings_goals, subscriptions = self._load_dashboard_datasets()
+
+        monthly_income = float(metrics["monthly_income"])
+        monthly_expense = float(metrics["monthly_expense"])
+        balance = float(metrics["balance"])
+        savings_total = sum(float(goal["current_amount"]) for goal in savings_goals) if savings_goals else 0.0
+        active_subs = [sub for sub in subscriptions if sub["active"] == 1]
+        subscription_total = sum(float(sub["amount"]) for sub in active_subs)
+        expensive_sub = max(active_subs, key=lambda sub: float(sub["amount"])) if active_subs else None
+        health_score = self.calculate_economic_health(balance, monthly_income, monthly_expense, savings_total, subscription_total)
+
+        labels, forecast_values = self.compute_balance_forecast(6)
+        trend_change = 0.0
+        if forecast_values:
+            trend_change = float(forecast_values[-1] - forecast_values[0])
+        trend_text = "Stigende" if trend_change > 0 else ("Faldende" if trend_change < 0 else "Stabil")
+
+        header = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        header.pack(fill="x", padx=8, pady=(8, 8))
+        tk.Label(header, text="🤖 AI Rådgiver", bg=self.colors["background"], fg=self.colors["text"], font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Datadrevet analyse af din økonomi", bg=self.colors["background"], fg=self.colors["muted"]).pack(anchor="w")
+
+        overview = self.create_card(self.canvas_content, "Nøgletal")
+        overview.pack(fill="x", padx=8, pady=(0, 8))
+        for label, value, color in [
+            ("Økonomisk sundhed (0-100)", str(health_score), self.colors["primary"]),
+            ("Største kategori", metrics["largest_category"], self.colors["text"]),
+            ("Dyreste abonnement", expensive_sub["name"] if expensive_sub is not None else "Ingen", self.colors["warning"]),
+            ("Månedlige udgifter", self.format_currency(monthly_expense), self.colors["danger"]),
+            ("Månedlige indtægter", self.format_currency(monthly_income), self.colors["success"]),
+            ("Saldo trend", f"{trend_text} ({self.format_currency(trend_change)})", self.colors["text"]),
+        ]:
+            row = tk.Frame(overview, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+            tk.Label(row, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        grid = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        grid.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+
+        budget_card = self.create_card(grid, "Budgetanalyse")
+        tk.Label(budget_card, text=f"• Indtægter: {self.format_currency(monthly_income)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(budget_card, text=f"• Udgifter: {self.format_currency(monthly_expense)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(budget_card, text=f"• Disponibelt: {self.format_currency(monthly_income - monthly_expense)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+
+        subs_card = self.create_card(grid, "Abonnementsanalyse")
+        tk.Label(subs_card, text=f"• Aktive abonnementer: {len(active_subs)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(subs_card, text=f"• Månedlig total: {self.format_currency(subscription_total)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        if expensive_sub is not None:
+            tk.Label(subs_card, text=f"• Dyreste: {expensive_sub['name']} ({self.format_currency(float(expensive_sub['amount']))})", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(subs_card, text=f"• Mulig besparelse (25%): {self.format_currency(float(expensive_sub['amount']) * 0.25)}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=14, pady=3)
+
+        savings_card = self.create_card(grid, "Opsparingsanalyse")
+        tk.Label(savings_card, text=f"• Samlet opsparing: {self.format_currency(savings_total)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(savings_card, text=f"• Antal mål: {len(savings_goals)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        savings_rate = (savings_total / monthly_income * 100.0) if monthly_income > 0 else 0.0
+        tk.Label(savings_card, text=f"• Opsparingsgrad: {savings_rate:.1f}%", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+
+        forecast_card = self.create_card(grid, "Fremtidsprognose")
+        tk.Label(forecast_card, text=f"• Trend: {trend_text}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        tk.Label(forecast_card, text=f"• Forventet ændring (6 mdr): {self.format_currency(trend_change)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+        chart_card = self.render_forecast_chart(forecast_card)
+        chart_card.pack(fill="x", padx=8, pady=4)
+
+        ai_cards = [budget_card, subs_card, savings_card, forecast_card]
+        one_column = self.winfo_width() <= 1000
+        for idx, card in enumerate(ai_cards):
+            if one_column:
+                card.grid(row=idx, column=0, sticky="nsew", padx=5, pady=5, columnspan=2)
+            else:
+                row = idx // 2
+                col = idx % 2
+                card.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
+
+        if self.household_member and self.household is not None:
+            household_summary = self.service.get_household_financial_summary(int(self.household["id"]))
+            household_card = self.create_card(self.canvas_content, "Familieanalyse")
+            household_card.pack(fill="x", padx=8, pady=(0, 8))
+            household_health = self.calculate_economic_health(
+                float(household_summary["balance"]),
+                float(household_summary["income"]),
+                float(household_summary["expense"]),
+                float(household_summary["savings"]),
+                float(household_summary["subscriptions"]),
+            )
+            tk.Label(household_card, text=f"• Fælles saldo: {self.format_currency(float(household_summary['balance']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Fælles udgifter: {self.format_currency(float(household_summary['expense']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Fælles indtægter: {self.format_currency(float(household_summary['income']))}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Højeste udgiftskategori: {metrics['largest_category']}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Største abonnement: {expensive_sub['name'] if expensive_sub is not None else 'Ingen'}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Potentielle besparelser: {self.format_currency(subscription_total * 0.25)}", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", padx=14, pady=3)
+            tk.Label(household_card, text=f"• Husstandens økonomiske sundhed: {household_health}/100", bg=self.colors["surface"], fg=self.colors["primary"]).pack(anchor="w", padx=14, pady=3)
+
+        self._perf_log("render_ai_advisor_page", started_at)
 
     def render_calendar_page(self):
         card = self.create_card(self.canvas_content, "Kalender", "Planlæg og følg dine betalinger")
@@ -1208,34 +1718,67 @@ class FamilBudgetApp(tk.Tk):
             btn2.pack(anchor="w", padx=16, pady=4)
             return
 
+        owner_id = self.household["owner_id"] if "owner_id" in self.household.keys() else None
+        created_at = self.household["created_at"] if "created_at" in self.household.keys() else ""
         admin_name = ""
-        if self.household.get("owner_id") is not None:
-            owner = self.service.get_user_by_id(self.household["owner_id"])
-            admin_name = owner["full_name"] if owner else str(self.household.get("owner_id", ""))
+        if owner_id is not None:
+            owner = self.service.get_user_by_id(owner_id)
+            admin_name = owner["full_name"] if owner else str(owner_id)
+
+        members = self.service.get_household_members(self.household["id"])
+        family_summary = self.service.get_household_financial_summary(self.household["id"])
 
         tk.Label(card, text=self.household["name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         tk.Label(card, text=f"Administrator: {admin_name}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        members = self.service.get_household_members(self.household["id"])
-        tk.Label(card, text=f"Medlemsantal: {len(members)}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        tk.Label(card, text=f"Delingskode: {self.household['invite_code']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        tk.Label(card, text=f"Oprettet: {self.household.get('created_at', '')}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=(2, 16))
+        tk.Label(card, text=f"Oprettet: {created_at}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
+        tk.Label(card, text=f"Invite kode: {self.household['invite_code']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
+        tk.Label(card, text=f"Medlemmer: {len(members)}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=(2, 12))
+
+        shared_stats = tk.Frame(card, bg=self.colors["surface"])
+        shared_stats.pack(fill="x", padx=16, pady=(0, 12))
+        for idx, (label, value, color) in enumerate([
+            ("Fælles saldo", self.format_currency(float(family_summary["balance"])), self.colors["primary"]),
+            ("Fælles budget (udgifter)", self.format_currency(float(family_summary["expense"])), self.colors["danger"]),
+            ("Fælles indtægter", self.format_currency(float(family_summary["income"])), self.colors["success"]),
+            ("Fælles opsparing", self.format_currency(float(family_summary["savings"])), self.colors["text"]),
+            ("Fælles abonnementer", self.format_currency(float(family_summary["subscriptions"])), self.colors["warning"]),
+        ]):
+            row = tk.Frame(shared_stats, bg=self.colors["surface"])
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+            tk.Label(row, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 10, "bold")).pack(side="right")
 
         actions = tk.Frame(card, bg=self.colors["surface"])
         actions.pack(fill="x", padx=16, pady=(0, 12))
         copy_btn = tk.Button(actions, text="Kopiér kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.copy_household_code)
-        copy_btn.pack(anchor="w", pady=4)
-        share_btn = tk.Button(actions, text="Del kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.copy_household_code)
-        share_btn.pack(anchor="w", pady=4)
-        regenerate_btn = tk.Button(actions, text="Generér ny kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.regenerate_household_code)
-        regenerate_btn.pack(anchor="w", pady=4)
+        copy_btn.pack(anchor="w", pady=2)
+        share_btn = tk.Button(actions, text="Del kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.share_household_code)
+        share_btn.pack(anchor="w", pady=2)
+        leave_btn = tk.Button(actions, text="Forlad husstand", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.leave_household)
+        leave_btn.pack(anchor="w", pady=2)
+        if self.is_current_user_household_admin():
+            regenerate_btn = tk.Button(actions, text="Generér ny kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.regenerate_household_code)
+            regenerate_btn.pack(anchor="w", pady=2)
+            delete_btn = tk.Button(actions, text="Slet husstand", bg=self.colors["danger"], fg="white", bd=0, padx=8, pady=8, relief="flat", command=self.delete_household)
+            delete_btn.pack(anchor="w", pady=2)
 
         members_card = self.create_card(self.canvas_content, "Medlemmer", "Medlemmerne er samlet i moderne profiler")
         members_card.pack(fill="x", padx=8, pady=(0, 8))
         for member in members:
             row = tk.Frame(members_card, bg=self.colors["surface"])
             row.pack(fill="x", padx=16, pady=8)
-            tk.Label(row, text=member["full_name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
-            tk.Label(row, text=f"{member['role']} • {member['email']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+            info = tk.Frame(row, bg=self.colors["surface"])
+            info.pack(side="left", fill="x", expand=True)
+            tk.Label(info, text=member["full_name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            tk.Label(info, text=f"{member['role']} • {member['email']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+
+            if self.is_current_user_household_admin() and member["user_id"] != self.current_user_id:
+                actions_frame = tk.Frame(row, bg=self.colors["surface"])
+                actions_frame.pack(side="right")
+                role_btn = tk.Button(actions_frame, text="Skift rolle", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=6, pady=6, relief="flat", command=lambda u=member["user_id"], r=member["role"]: self.open_change_member_role_dialog(u, r))
+                role_btn.pack(side="left", padx=4)
+                remove_btn = tk.Button(actions_frame, text="Fjern", bg=self.colors["danger"], fg="white", bd=0, padx=6, pady=6, relief="flat", command=lambda u=member["user_id"]: self.remove_household_member(u))
+                remove_btn.pack(side="left", padx=4)
 
     def open_create_household_dialog(self):
         def build_content(body):
@@ -1253,8 +1796,10 @@ class FamilBudgetApp(tk.Tk):
                     return
                 household_id, invite_code = self.service.create_household(name, self.current_user_id)
                 self.refresh_household_state()
+                self.load_transactions()
+                self.load_notifications()
                 self.close_active_panel()
-                self.show_page("husstand")
+                self.show_page("husstand", force=True)
                 messagebox.showinfo("Husstand oprettet", f"Husstanden er oprettet. Kode: {invite_code}")
 
             tk.Button(body, text="Opret husstand", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=8, relief="flat", command=create).pack(pady=(16, 0))
@@ -1277,8 +1822,10 @@ class FamilBudgetApp(tk.Tk):
                     return
                 if self.service.join_household(self.current_user_id, code):
                     self.refresh_household_state()
+                    self.load_transactions()
+                    self.load_notifications()
                     self.close_active_panel()
-                    self.show_page("husstand")
+                    self.show_page("husstand", force=True)
                     messagebox.showinfo("Tilknytning lykkedes", "Du er nu medlem af husstanden.")
                     return
                 messagebox.showerror("Fejl", "Koden er ugyldig.")
@@ -1294,13 +1841,84 @@ class FamilBudgetApp(tk.Tk):
         self.clipboard_append(self.household["invite_code"])
         messagebox.showinfo("Kode kopieret", "Husstandskoden er kopieret til udklipsholder.")
 
+    def share_household_code(self):
+        self.copy_household_code()
+        messagebox.showinfo("Del kode", "Koden er klar til at blive delt.")
+
     def regenerate_household_code(self):
         if self.household is None:
             return
+        if not self.is_current_user_household_admin():
+            messagebox.showerror("Fejl", "Kun administrator kan generere ny kode.")
+            return
         invite_code = self.service.regenerate_household_invite_code(self.household["id"])
         self.refresh_household_state()
-        self.show_page("husstand")
+        self.show_page("husstand", force=True)
         messagebox.showinfo("Ny kode", f"Ny invite-kode: {invite_code}")
+
+    def leave_household(self):
+        if self.household is None or self.current_user_id is None:
+            return
+        if not messagebox.askyesno("Forlad husstand", "Er du sikker på, at du vil forlade husstanden?"):
+            return
+        self.service.leave_household(self.household["id"], self.current_user_id)
+        self.refresh_household_state()
+        self.load_transactions()
+        self.load_notifications()
+        self.show_page("husstand", force=True)
+
+    def delete_household(self):
+        if self.household is None:
+            return
+        if not self.is_current_user_household_admin():
+            messagebox.showerror("Fejl", "Kun administrator kan slette husstanden.")
+            return
+        if not messagebox.askyesno("Slet husstand", "Vil du slette hele husstanden? Dette kan ikke fortrydes."):
+            return
+        self.service.delete_household(self.household["id"])
+        self.refresh_household_state()
+        self.load_transactions()
+        self.load_notifications()
+        self.show_page("husstand", force=True)
+
+    def remove_household_member(self, member_user_id: int):
+        if self.household is None:
+            return
+        if not self.is_current_user_household_admin():
+            messagebox.showerror("Fejl", "Kun administrator kan fjerne medlemmer.")
+            return
+        role = self.service.get_household_member_role(self.household["id"], member_user_id)
+        if role == "owner":
+            messagebox.showerror("Fejl", "Ejeren kan ikke fjernes direkte. Brug Forlad husstand for ejeren.")
+            return
+        self.service.remove_household_member(self.household["id"], member_user_id)
+        self.show_page("husstand", force=True)
+
+    def open_change_member_role_dialog(self, member_user_id: int, current_role: str):
+        if self.household is None:
+            return
+        if not self.is_current_user_household_admin():
+            messagebox.showerror("Fejl", "Kun administrator kan ændre roller.")
+            return
+
+        def build_content(body):
+            role_var = tk.StringVar(value=current_role)
+            tk.Label(body, text="Vælg ny rolle", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(8, 4))
+            role_combo = ttk.Combobox(body, textvariable=role_var, values=["member", "admin"], state="readonly")
+            role_combo.pack(fill="x")
+
+            def save_role():
+                role = role_var.get().strip()
+                if role not in ("member", "admin"):
+                    messagebox.showerror("Fejl", "Vælg en gyldig rolle.")
+                    return
+                self.service.change_household_member_role(self.household["id"], member_user_id, role)
+                self.close_active_panel()
+                self.show_page("husstand", force=True)
+
+            tk.Button(body, text="Gem rolle", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=8, relief="flat", command=save_role).pack(pady=(16, 0))
+
+        self.show_modal_panel("Skift rolle", build_content, width=320)
 
     def render_profile_page(self):
         if self.current_user is None:
@@ -1461,6 +2079,114 @@ class FamilBudgetApp(tk.Tk):
     def open_transaction_form(self):
         self.show_add_dialog()
 
+    def open_subscription_form(self, subscription=None):
+        def build_content(body):
+            name_var = tk.StringVar(value=subscription["name"] if subscription is not None else "")
+            amount_var = tk.StringVar(value=str(subscription["amount"]) if subscription is not None else "")
+            billing_var = tk.StringVar(value=(subscription["billing_date"] if subscription is not None and "billing_date" in subscription.keys() and subscription["billing_date"] else ""))
+            active_var = tk.IntVar(value=(subscription["active"] if subscription is not None else 1))
+            scope_var = tk.StringVar(value="husstand" if subscription is not None and "household_id" in subscription.keys() and subscription["household_id"] else "privat")
+
+            tk.Label(body, text="Navn", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(4, 4))
+            tk.Entry(body, textvariable=name_var).pack(fill="x")
+            tk.Label(body, text="Beløb", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+            tk.Entry(body, textvariable=amount_var).pack(fill="x")
+            tk.Label(body, text="Betalingsdato", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+            tk.Entry(body, textvariable=billing_var).pack(fill="x")
+            tk.Checkbutton(body, text="Aktiv", variable=active_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w", pady=(10, 0))
+
+            if self.household_member and self.household is not None:
+                tk.Label(body, text="Gælder for", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+                tk.Radiobutton(body, text="Privat", value="privat", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+                tk.Radiobutton(body, text="Husstand", value="husstand", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+
+            def save():
+                name = name_var.get().strip()
+                amount_text = amount_var.get().strip()
+                if not name or not amount_text:
+                    messagebox.showerror("Fejl", "Udfyld navn og beløb.")
+                    return
+                try:
+                    amount = float(amount_text)
+                except ValueError:
+                    messagebox.showerror("Fejl", "Beløbet skal være et tal.")
+                    return
+                household_id = self.household["id"] if self.household_member and self.household is not None and scope_var.get() == "husstand" else None
+                if subscription is None:
+                    self.service.create_subscription(self.current_user_id, name, amount, billing_var.get().strip() or None, bool(active_var.get()), household_id=household_id)
+                else:
+                    self.service.update_subscription(subscription["id"], name, amount, billing_var.get().strip() or None, bool(active_var.get()), household_id=household_id)
+                self.close_active_panel()
+                self.show_page("abonnementer", force=True)
+
+            action_text = "Tilføj abonnement" if subscription is None else "Gem ændringer"
+            tk.Button(body, text=action_text, bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=8, relief="flat", command=save).pack(pady=(16, 0))
+
+        title = "Tilføj abonnement" if subscription is None else "Rediger abonnement"
+        self.show_modal_panel(title, build_content, width=380)
+
+    def delete_subscription(self, subscription_id: int):
+        if not messagebox.askyesno("Slet abonnement", "Vil du slette abonnementet?"):
+            return
+        self.service.delete_subscription(subscription_id)
+        self.show_page("abonnementer", force=True)
+
+    def open_savings_goal_form(self, goal=None):
+        def build_content(body):
+            title_var = tk.StringVar(value=goal["title"] if goal is not None else "")
+            target_var = tk.StringVar(value=str(goal["target_amount"]) if goal is not None else "")
+            current_var = tk.StringVar(value=str(goal["current_amount"]) if goal is not None else "0")
+            due_var = tk.StringVar(value=(goal["due_date"] if goal is not None and "due_date" in goal.keys() and goal["due_date"] else ""))
+            scope_var = tk.StringVar(value="husstand" if goal is not None and "household_id" in goal.keys() and goal["household_id"] else "privat")
+
+            tk.Label(body, text="Titel", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(4, 4))
+            tk.Entry(body, textvariable=title_var).pack(fill="x")
+            tk.Label(body, text="Målbeløb", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+            tk.Entry(body, textvariable=target_var).pack(fill="x")
+            tk.Label(body, text="Nuværende beløb", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+            tk.Entry(body, textvariable=current_var).pack(fill="x")
+            tk.Label(body, text="Måldato", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+            tk.Entry(body, textvariable=due_var).pack(fill="x")
+
+            if self.household_member and self.household is not None:
+                tk.Label(body, text="Gælder for", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+                tk.Radiobutton(body, text="Privat", value="privat", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+                tk.Radiobutton(body, text="Husstand", value="husstand", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+
+            def save():
+                title = title_var.get().strip()
+                target_text = target_var.get().strip()
+                current_text = current_var.get().strip()
+                if not title or not target_text:
+                    messagebox.showerror("Fejl", "Udfyld titel og målbeløb.")
+                    return
+                try:
+                    target = float(target_text)
+                    current = float(current_text or "0")
+                except ValueError:
+                    messagebox.showerror("Fejl", "Beløb skal være tal.")
+                    return
+                household_id = self.household["id"] if self.household_member and self.household is not None and scope_var.get() == "husstand" else None
+                if goal is None:
+                    goal_id = self.service.create_savings_goal(self.current_user_id, title, target, due_var.get().strip() or None, household_id=household_id)
+                    self.service.update_savings_goal(goal_id, title, target, current, due_var.get().strip() or None, household_id=household_id)
+                else:
+                    self.service.update_savings_goal(goal["id"], title, target, current, due_var.get().strip() or None, household_id=household_id)
+                self.close_active_panel()
+                self.show_page("opsparing", force=True)
+
+            action_text = "Tilføj mål" if goal is None else "Gem ændringer"
+            tk.Button(body, text=action_text, bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=8, relief="flat", command=save).pack(pady=(16, 0))
+
+        title = "Tilføj opsparingsmål" if goal is None else "Rediger opsparingsmål"
+        self.show_modal_panel(title, build_content, width=380)
+
+    def delete_savings_goal(self, goal_id: int):
+        if not messagebox.askyesno("Slet opsparingsmål", "Vil du slette dette mål?"):
+            return
+        self.service.delete_savings_goal(goal_id)
+        self.show_page("opsparing", force=True)
+
     def open_quick_add(self, kind):
         if kind == "Udgift":
             self.show_add_dialog("Udgift", "Udgift")
@@ -1488,6 +2214,14 @@ class FamilBudgetApp(tk.Tk):
             combo = ttk.Combobox(body, textvariable=type_var, values=["Indtægt", "Udgift"], state="readonly")
             combo.pack(fill="x")
 
+            scope_var = tk.StringVar(value="privat")
+            if self.household_member and self.household is not None:
+                tk.Label(body, text="Gælder for", bg=self.colors["surface"], fg=self.colors["text"]).pack(anchor="w", pady=(10, 4))
+                scope_frame = tk.Frame(body, bg=self.colors["surface"])
+                scope_frame.pack(fill="x")
+                tk.Radiobutton(scope_frame, text="Privat", value="privat", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+                tk.Radiobutton(scope_frame, text="Husstand", value="husstand", variable=scope_var, bg=self.colors["surface"], fg=self.colors["text"], selectcolor=self.colors["surface_2"]).pack(anchor="w")
+
             def save():
                 kategori = category_var.get().strip()
                 beloeb_text = amount_var.get().strip()
@@ -1500,12 +2234,16 @@ class FamilBudgetApp(tk.Tk):
                 except ValueError:
                     messagebox.showerror("Fejl", "Beløbet skal være et tal")
                     return
+                household_id = None
+                if self.household_member and self.household is not None and scope_var.get() == "husstand":
+                    household_id = self.household["id"]
                 self.service.save_transaction(
                     self.current_user_id,
                     str(date.today()),
                     kategori,
                     beloeb,
                     typ,
+                    household_id=household_id,
                 )
                 self.load_transactions()
                 self.refresh_notifications()
@@ -1527,17 +2265,20 @@ class FamilBudgetApp(tk.Tk):
                 now_ts = int(time.time())
                 last_status_ts = int(self.service.get_setting("last_budget_status_ts", "0") or "0")
                 if now_ts - last_status_ts >= 3600:
+                    household_id = self.household["id"] if self.household_member and self.household is not None else None
                     self.service.save_notification(
                         user_id,
                         "Budget status",
                         "Din saldo er stabil og klar til næste uge",
                         "info",
+                        household_id=household_id,
                     )
                     self.service.save_setting("last_budget_status_ts", str(now_ts))
                     rows = self.service.get_notifications(user_id)
             except Exception as exc:
+                error_text = f"Kunne ikke opdatere notifikationer: {exc}"
                 def on_error():
-                    messagebox.showerror("Fejl", f"Kunne ikke opdatere notifikationer: {exc}")
+                    messagebox.showerror("Fejl", error_text)
                 self.after(0, on_error)
                 return
 
@@ -1553,7 +2294,8 @@ class FamilBudgetApp(tk.Tk):
         self._perf_log("refresh_notifications_dispatch", started_at)
 
     def save_notification(self, title, message, kind):
-        self.service.save_notification(self.current_user_id, title, message, kind)
+        household_id = self.household["id"] if self.household_member and self.household is not None else None
+        self.service.save_notification(self.current_user_id, title, message, kind, household_id=household_id)
 
     def open_notifications(self):
         def build_content(body):

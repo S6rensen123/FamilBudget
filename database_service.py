@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
+from config import get_supabase_desktop_config
 
 
 class DatabaseProvider(ABC):
@@ -103,9 +104,14 @@ class SQLiteProvider(DatabaseProvider):
 
 
 class SupabaseProvider(DatabaseProvider):
-    def __init__(self, project_url: str = "", api_key: str = "") -> None:
+    def __init__(self, project_url: str = "", publishable_key: str = "", api_key: str = "") -> None:
+        resolved_key = publishable_key or api_key
+        if not project_url:
+            raise RuntimeError("Supabase konfiguration mangler SUPABASE_URL.")
+        if not resolved_key:
+            raise RuntimeError("Supabase konfiguration mangler SUPABASE_PUBLISHABLE_KEY.")
         self.project_url = project_url
-        self.api_key = api_key
+        self.publishable_key = resolved_key
         self.connected = False
 
     def _unsupported(self) -> None:
@@ -147,6 +153,12 @@ class DatabaseService:
         if provider_name == "sqlite":
             self.provider = SQLiteProvider(database_path)
         elif provider_name == "supabase":
+            if not provider_config:
+                provider_config = get_supabase_desktop_config()
+            if "secret_key" in provider_config or "SUPABASE_SECRET_KEY" in provider_config:
+                raise RuntimeError(
+                    "Desktop app må ikke bruge SUPABASE_SECRET_KEY. Brug kun SUPABASE_URL og SUPABASE_PUBLISHABLE_KEY."
+                )
             self.provider = SupabaseProvider(**provider_config)
         else:
             raise ValueError(f"Unsupported provider: {provider_name}")
@@ -280,7 +292,11 @@ class DatabaseService:
         )
 
         self._ensure_column("transactions", "user_id", "user_id INTEGER")
+        self._ensure_column("transactions", "household_id", "household_id INTEGER")
         self._ensure_column("notifications", "user_id", "user_id INTEGER")
+        self._ensure_column("notifications", "household_id", "household_id INTEGER")
+        self._ensure_column("subscriptions", "household_id", "household_id INTEGER")
+        self._ensure_column("savings_goals", "household_id", "household_id INTEGER")
         self.provider.commit()
 
     def get_setting(self, key: str, default: str = "") -> str:
@@ -444,10 +460,120 @@ class DatabaseService:
 
     def get_household_members(self, household_id: int) -> List[sqlite3.Row]:
         self.provider.execute(
-            "SELECT users.full_name, users.email, household_members.role FROM household_members JOIN users ON users.id = household_members.user_id WHERE household_members.household_id = ?",
+            "SELECT users.id as user_id, users.full_name, users.email, household_members.role FROM household_members JOIN users ON users.id = household_members.user_id WHERE household_members.household_id = ?",
             (household_id,),
         )
         return list(self.provider.fetchall())
+
+    def get_household_member_role(self, household_id: int, user_id: int) -> Optional[str]:
+        self.provider.execute(
+            "SELECT role FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, user_id),
+        )
+        row = self.provider.fetchone()
+        return str(row["role"]) if row is not None else None
+
+    def is_household_admin(self, household_id: int, user_id: int) -> bool:
+        role = self.get_household_member_role(household_id, user_id)
+        return role in ("owner", "admin")
+
+    def change_household_member_role(self, household_id: int, target_user_id: int, new_role: str) -> None:
+        self.provider.execute(
+            "UPDATE household_members SET role = ? WHERE household_id = ? AND user_id = ?",
+            (new_role, household_id, target_user_id),
+        )
+        self.provider.commit()
+
+    def remove_household_member(self, household_id: int, target_user_id: int) -> None:
+        self.provider.execute(
+            "DELETE FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, target_user_id),
+        )
+        self.provider.commit()
+
+    def leave_household(self, household_id: int, user_id: int) -> None:
+        self.provider.execute("SELECT owner_id FROM households WHERE id = ?", (household_id,))
+        household = self.provider.fetchone()
+        if household is None:
+            return
+
+        owner_id = household["owner_id"]
+        self.remove_household_member(household_id, user_id)
+        if owner_id != user_id:
+            return
+
+        self.provider.execute(
+            "SELECT user_id FROM household_members WHERE household_id = ? ORDER BY id ASC LIMIT 1",
+            (household_id,),
+        )
+        next_owner = self.provider.fetchone()
+        if next_owner is None:
+            self.delete_household(household_id)
+            return
+
+        new_owner_id = next_owner["user_id"]
+        self.provider.execute(
+            "UPDATE households SET owner_id = ? WHERE id = ?",
+            (new_owner_id, household_id),
+        )
+        self.provider.execute(
+            "UPDATE household_members SET role = 'owner' WHERE household_id = ? AND user_id = ?",
+            (household_id, new_owner_id),
+        )
+        self.provider.commit()
+
+    def delete_household(self, household_id: int) -> None:
+        self.provider.execute("DELETE FROM households WHERE id = ?", (household_id,))
+        self.provider.commit()
+
+    def get_household_financial_summary(self, household_id: int) -> Dict[str, Any]:
+        self.provider.execute(
+            "SELECT user_id FROM household_members WHERE household_id = ?",
+            (household_id,),
+        )
+        member_rows = list(self.provider.fetchall())
+        member_ids = [int(row["user_id"]) for row in member_rows]
+        member_placeholders = ",".join("?" for _ in member_ids)
+        member_clause = f"user_id IN ({member_placeholders})" if member_ids else "0=1"
+
+        self.provider.execute(
+            f"SELECT type, beloeb FROM transactions WHERE household_id = ? OR {member_clause}",
+            (household_id, *member_ids),
+        )
+        tx_rows = list(self.provider.fetchall())
+        income = sum(float(row["beloeb"]) for row in tx_rows if row["type"] == "Indtægt")
+        expense = sum(float(row["beloeb"]) for row in tx_rows if row["type"] != "Indtægt")
+        balance = income - expense
+
+        self.provider.execute(
+            f"SELECT current_amount FROM savings_goals WHERE household_id = ? OR {member_clause}",
+            (household_id, *member_ids),
+        )
+        savings_rows = list(self.provider.fetchall())
+        household_savings = sum(float(row["current_amount"]) for row in savings_rows)
+
+        self.provider.execute(
+            f"SELECT amount FROM subscriptions WHERE active = 1 AND (household_id = ? OR {member_clause})",
+            (household_id, *member_ids),
+        )
+        sub_rows = list(self.provider.fetchall())
+        household_subscriptions = sum(float(row["amount"]) for row in sub_rows)
+
+        self.provider.execute(
+            "SELECT COUNT(*) as count FROM household_members WHERE household_id = ?",
+            (household_id,),
+        )
+        count_row = self.provider.fetchone()
+        member_count = int(count_row["count"]) if count_row is not None else 0
+
+        return {
+            "balance": balance,
+            "income": income,
+            "expense": expense,
+            "savings": household_savings,
+            "subscriptions": household_subscriptions,
+            "member_count": member_count,
+        }
 
     def save_transaction(
         self,
@@ -456,8 +582,16 @@ class DatabaseService:
         kategori: str,
         beloeb: float,
         type_: str,
+        household_id: Optional[int] = None,
     ) -> int:
-        if self.provider.has_column("transactions", "user_id"):
+        has_user = self.provider.has_column("transactions", "user_id")
+        has_household = self.provider.has_column("transactions", "household_id")
+        if has_user and has_household:
+            self.provider.execute(
+                "INSERT INTO transactions (user_id, household_id, dato, kategori, beloeb, type) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, household_id, dato, kategori.strip(), beloeb, type_.strip()),
+            )
+        elif has_user:
             self.provider.execute(
                 "INSERT INTO transactions (user_id, dato, kategori, beloeb, type) VALUES (?, ?, ?, ?, ?)",
                 (user_id, dato, kategori.strip(), beloeb, type_.strip()),
@@ -471,9 +605,23 @@ class DatabaseService:
         return int(self.provider.lastrowid())
 
     def get_transactions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
-        if self.provider.has_column("transactions", "user_id"):
+        has_user = self.provider.has_column("transactions", "user_id")
+        has_household = self.provider.has_column("transactions", "household_id")
+        if has_user:
             if user_id is None:
                 self.provider.execute("SELECT * FROM transactions ORDER BY id DESC")
+            elif has_household:
+                household = self.get_household_for_user(user_id)
+                if household is None:
+                    self.provider.execute(
+                        "SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC",
+                        (user_id,),
+                    )
+                else:
+                    self.provider.execute(
+                        "SELECT * FROM transactions WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                        (user_id, household["id"]),
+                    )
             else:
                 self.provider.execute(
                     "SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC",
@@ -486,18 +634,73 @@ class DatabaseService:
     def load_transactions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         return self.get_transactions(user_id)
 
-    def get_notifications(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
-        if self.provider.has_column("notifications", "user_id") and user_id is not None:
+    def update_transaction(
+        self,
+        transaction_id: int,
+        dato: str,
+        kategori: str,
+        beloeb: float,
+        type_: str,
+        household_id: Optional[int] = None,
+    ) -> None:
+        if self.provider.has_column("transactions", "household_id"):
             self.provider.execute(
-                "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 8",
-                (user_id,),
+                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ?, household_id = ? WHERE id = ?",
+                (dato, kategori.strip(), beloeb, type_.strip(), household_id, transaction_id),
             )
+        else:
+            self.provider.execute(
+                "UPDATE transactions SET dato = ?, kategori = ?, beloeb = ?, type = ? WHERE id = ?",
+                (dato, kategori.strip(), beloeb, type_.strip(), transaction_id),
+            )
+        self.provider.commit()
+
+    def delete_transaction(self, transaction_id: int) -> None:
+        self.provider.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+        self.provider.commit()
+
+    def get_notifications(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+        has_user = self.provider.has_column("notifications", "user_id")
+        has_household = self.provider.has_column("notifications", "household_id")
+        if has_user and user_id is not None:
+            if has_household:
+                household = self.get_household_for_user(user_id)
+                if household is None:
+                    self.provider.execute(
+                        "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+                        (user_id,),
+                    )
+                else:
+                    self.provider.execute(
+                        "SELECT * FROM notifications WHERE user_id = ? OR household_id = ? ORDER BY id DESC LIMIT 8",
+                        (user_id, household["id"]),
+                    )
+            else:
+                self.provider.execute(
+                    "SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+                    (user_id,),
+                )
         else:
             self.provider.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 8")
         return list(self.provider.fetchall())
 
-    def save_notification(self, user_id: Optional[int], title: str, message: str, kind: str) -> None:
-        if self.provider.has_column("notifications", "user_id"):
+    def save_notification(
+        self,
+        user_id: Optional[int],
+        title: str,
+        message: str,
+        kind: str,
+        household_id: Optional[int] = None,
+    ) -> None:
+        has_user = self.provider.has_column("notifications", "user_id")
+        has_household = self.provider.has_column("notifications", "household_id")
+        if has_user and has_household:
+            self.provider.execute(
+                "SELECT id FROM notifications WHERE user_id = ? AND ((household_id = ?) OR (household_id IS NULL AND ? IS NULL)) AND title = ? AND message = ?",
+                (user_id, household_id, household_id, title, message),
+            )
+            exists = self.provider.fetchone() is not None
+        elif has_user:
             self.provider.execute(
                 "SELECT id FROM notifications WHERE user_id = ? AND title = ? AND message = ?",
                 (user_id, title, message),
@@ -511,7 +714,12 @@ class DatabaseService:
             exists = self.provider.fetchone() is not None
 
         if not exists:
-            if self.provider.has_column("notifications", "user_id"):
+            if has_user and has_household:
+                self.provider.execute(
+                    "INSERT INTO notifications (user_id, household_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, household_id, title, message, kind, 0, self._now()),
+                )
+            elif has_user:
                 self.provider.execute(
                     "INSERT INTO notifications (user_id, title, message, kind, read, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (user_id, title, message, kind, 0, self._now()),
@@ -556,10 +764,36 @@ class DatabaseService:
 
     def get_savings_goals(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         if user_id is not None:
-            self.provider.execute("SELECT * FROM savings_goals WHERE user_id = ? ORDER BY id DESC", (user_id,))
+            household = self.get_household_for_user(user_id)
+            if household is None:
+                self.provider.execute("SELECT * FROM savings_goals WHERE user_id = ? ORDER BY id DESC", (user_id,))
+            else:
+                self.provider.execute(
+                    "SELECT * FROM savings_goals WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                    (user_id, household["id"]),
+                )
         else:
             self.provider.execute("SELECT * FROM savings_goals ORDER BY id DESC")
         return list(self.provider.fetchall())
+
+    def update_savings_goal(
+        self,
+        goal_id: int,
+        title: str,
+        target_amount: float,
+        current_amount: float,
+        due_date: Optional[str] = None,
+        household_id: Optional[int] = None,
+    ) -> None:
+        self.provider.execute(
+            "UPDATE savings_goals SET title = ?, target_amount = ?, current_amount = ?, due_date = ?, household_id = ? WHERE id = ?",
+            (title.strip(), target_amount, current_amount, due_date, household_id, goal_id),
+        )
+        self.provider.commit()
+
+    def delete_savings_goal(self, goal_id: int) -> None:
+        self.provider.execute("DELETE FROM savings_goals WHERE id = ?", (goal_id,))
+        self.provider.commit()
 
     def create_subscription(
         self,
@@ -568,20 +802,63 @@ class DatabaseService:
         amount: float,
         billing_date: Optional[str] = None,
         active: bool = True,
+        household_id: Optional[int] = None,
     ) -> int:
-        self.provider.execute(
-            "INSERT INTO subscriptions (user_id, name, amount, billing_date, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
-        )
+        if self.provider.has_column("subscriptions", "household_id"):
+            self.provider.execute(
+                "INSERT INTO subscriptions (user_id, household_id, name, amount, billing_date, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, household_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
+            )
+        else:
+            self.provider.execute(
+                "INSERT INTO subscriptions (user_id, name, amount, billing_date, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
+            )
         self.provider.commit()
         return int(self.provider.lastrowid())
 
     def get_subscriptions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
+        has_household = self.provider.has_column("subscriptions", "household_id")
         if user_id is not None:
-            self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC", (user_id,))
+            if has_household:
+                household = self.get_household_for_user(user_id)
+                if household is None:
+                    self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC", (user_id,))
+                else:
+                    self.provider.execute(
+                        "SELECT * FROM subscriptions WHERE user_id = ? OR household_id = ? ORDER BY id DESC",
+                        (user_id, household["id"]),
+                    )
+            else:
+                self.provider.execute("SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC", (user_id,))
         else:
             self.provider.execute("SELECT * FROM subscriptions ORDER BY id DESC")
         return list(self.provider.fetchall())
+
+    def update_subscription(
+        self,
+        subscription_id: int,
+        name: str,
+        amount: float,
+        billing_date: Optional[str] = None,
+        active: bool = True,
+        household_id: Optional[int] = None,
+    ) -> None:
+        if self.provider.has_column("subscriptions", "household_id"):
+            self.provider.execute(
+                "UPDATE subscriptions SET name = ?, amount = ?, billing_date = ?, active = ?, household_id = ? WHERE id = ?",
+                (name.strip(), amount, billing_date, 1 if active else 0, household_id, subscription_id),
+            )
+        else:
+            self.provider.execute(
+                "UPDATE subscriptions SET name = ?, amount = ?, billing_date = ?, active = ? WHERE id = ?",
+                (name.strip(), amount, billing_date, 1 if active else 0, subscription_id),
+            )
+        self.provider.commit()
+
+    def delete_subscription(self, subscription_id: int) -> None:
+        self.provider.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
+        self.provider.commit()
 
     def close(self) -> None:
         self.provider.close()
