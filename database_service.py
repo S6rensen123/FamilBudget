@@ -6,6 +6,8 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import bcrypt
 from dotenv import load_dotenv
@@ -162,13 +164,10 @@ class SupabaseRestSyncTransport:
             "apikey": key,
             "Authorization": "Bearer " + key,
             "Content-Type": "application/json",
-            "Prefer": "return=minimal",
+            "Prefer": "return=representation",
         }
 
-    def sync_item(self, table_name: str, row_id: Optional[int], operation: str, payload: Dict[str, Any]) -> None:
-        import urllib.error
-        import urllib.request
-
+    def sync_item(self, table_name: str, row_id: Optional[str], operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.project_url:
             raise RuntimeError("Supabase URL mangler.")
 
@@ -176,42 +175,76 @@ class SupabaseRestSyncTransport:
         url = f"{self.project_url}/rest/v1/{table}"
         headers = self._headers()
 
-        def request(method: str, request_url: str, body: Optional[Dict[str, Any]] = None) -> None:
-            data = None if body is None else json.dumps(body).encode("utf-8")
-            req = urllib.request.Request(request_url, data=data, headers=headers, method=method)
+        def request(method: str, request_url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             print("[SYNC] URL:", request_url)
-            if body is not None:
-                print("[SYNC] Body:", json.dumps(body, ensure_ascii=True))
             try:
-                with urllib.request.urlopen(req, timeout=20) as response:
+                data = None if body is None else json.dumps(body).encode("utf-8")
+                req = urllib_request.Request(request_url, data=data, headers=headers, method=method)
+                with urllib_request.urlopen(req, timeout=20) as response:
                     response_body = response.read().decode("utf-8", errors="replace")
                     print("[SYNC] Status:", response.status)
                     print("[SYNC] Body:", response_body)
-            except urllib.error.HTTPError as exc:
-                error_body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+                if not response_body.strip():
+                    return {}
+                parsed_body = json.loads(response_body)
+                if isinstance(parsed_body, list):
+                    return parsed_body[0] if parsed_body else {}
+                if isinstance(parsed_body, dict):
+                    return parsed_body
+                return {}
+            except urllib_error.HTTPError as exc:
+                response_text = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
                 print("[SYNC] Status:", exc.code)
-                print("[SYNC] Body:", error_body)
+                print("[SYNC] Body:", response_text)
                 print("[SYNC ERROR]", str(exc))
-                raise RuntimeError(f"Supabase sync HTTP error for {table_name}: {exc.code} {exc.reason}") from exc
-            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Supabase sync request failed for {table_name}: {exc.code} {exc.reason}") from exc
+            except urllib_error.URLError as exc:
+                print("[SYNC] Body:", "")
                 print("[SYNC ERROR]", str(exc))
-                raise RuntimeError(f"Supabase sync connection error for {table_name}: {exc.reason}") from exc
+                raise RuntimeError(f"Supabase sync request failed for {table_name}: {exc.reason}") from exc
 
         if operation == "insert":
-            request("POST", url, payload)
+            return request("POST", f"{url}?select=id", payload)
         elif operation == "update":
             if row_id is None:
                 raise RuntimeError(f"Sync update mangler row_id for {table_name}.")
-            request("PATCH", f"{url}?id=eq.{row_id}", payload)
+            return request("PATCH", f"{url}?id=eq.{row_id}&select=id", payload)
         elif operation == "delete":
             if row_id is None:
                 raise RuntimeError(f"Sync delete mangler row_id for {table_name}.")
-            request("DELETE", f"{url}?id=eq.{row_id}")
+            return request("DELETE", f"{url}?id=eq.{row_id}&select=id")
         else:
             raise RuntimeError(f"Ukendt sync operation: {operation}")
 
 
 class DatabaseService:
+    SYNC_PRIORITY = {
+        "users": 10,
+        "households": 20,
+        "household_members": 30,
+        "transactions": 40,
+        "subscriptions": 50,
+        "savings_goals": 60,
+        "notifications": 70,
+    }
+    SUPABASE_ALLOWED_COLUMNS = {
+        "users": {"full_name", "email", "password_hash", "created_at", "role", "avatar_url"},
+        "households": {"name", "owner_id", "invite_code", "created_at"},
+        "household_members": {"household_id", "user_id", "role", "created_at"},
+        "transactions": {"user_id", "household_id", "dato", "kategori", "beloeb", "type", "note", "created_at"},
+        "notifications": {"user_id", "household_id", "title", "message", "kind", "read", "created_at"},
+        "subscriptions": {"user_id", "household_id", "name", "amount", "billing_date", "active", "created_at"},
+        "savings_goals": {"user_id", "household_id", "title", "target_amount", "current_amount", "due_date", "created_at"},
+    }
+    SUPABASE_FOREIGN_KEYS = {
+        "households": {"owner_id": "users"},
+        "household_members": {"household_id": "households", "user_id": "users"},
+        "transactions": {"user_id": "users", "household_id": "households"},
+        "notifications": {"user_id": "users", "household_id": "households"},
+        "subscriptions": {"user_id": "users", "household_id": "households"},
+        "savings_goals": {"user_id": "users", "household_id": "households"},
+    }
+
     def __init__(
         self,
         database_path: str = "budget.db",
@@ -397,6 +430,17 @@ class DatabaseService:
             )
             """
         )
+        self.provider.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_id_map (
+                table_name TEXT NOT NULL,
+                local_id INTEGER NOT NULL,
+                remote_uuid TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, local_id)
+            )
+            """
+        )
 
         self._ensure_column("transactions", "user_id", "user_id INTEGER")
         self._ensure_column("transactions", "household_id", "household_id INTEGER")
@@ -421,6 +465,83 @@ class DatabaseService:
         if row is None:
             return {}
         return {key: row[key] for key in row.keys()}
+
+    def _get_remote_uuid(self, table_name: str, local_id: Optional[int]) -> str:
+        if local_id is None:
+            return ""
+        self.provider.execute(
+            "SELECT remote_uuid FROM sync_id_map WHERE table_name = ? AND local_id = ?",
+            (table_name, local_id),
+        )
+        row = self.provider.fetchone()
+        return row["remote_uuid"] if row is not None else ""
+
+    def _set_remote_uuid(self, table_name: str, local_id: Optional[int], remote_uuid: str) -> None:
+        if local_id is None or not remote_uuid:
+            return
+        self.provider.execute(
+            """
+            INSERT INTO sync_id_map (table_name, local_id, remote_uuid, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(table_name, local_id)
+            DO UPDATE SET remote_uuid = excluded.remote_uuid
+            """,
+            (table_name, local_id, remote_uuid, self._now()),
+        )
+        self.provider.commit()
+
+    def _normalize_supabase_value(self, column_name: str, value: Any) -> Any:
+        if value in ("", None):
+            return None if value == "" else value
+        if column_name in {"read", "active"}:
+            return bool(value)
+        return value
+
+    def _map_supabase_foreign_key(self, table_name: str, column_name: str, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        target_table = self.SUPABASE_FOREIGN_KEYS.get(table_name, {}).get(column_name)
+        if target_table is None:
+            return value
+        remote_uuid = self._get_remote_uuid(target_table, int(value))
+        if not remote_uuid:
+            raise RuntimeError(
+                f"Mangler remote UUID for {target_table}.{value} referenced by {table_name}.{column_name}"
+            )
+        return remote_uuid
+
+    def _build_supabase_sync_item(
+        self,
+        table_name: str,
+        row_id: Optional[int],
+        operation: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        allowed_columns = self.SUPABASE_ALLOWED_COLUMNS.get(table_name)
+        if allowed_columns is None:
+            raise RuntimeError(f"Sync mapping mangler for tabel {table_name}")
+
+        remote_row_id = self._get_remote_uuid(table_name, row_id)
+        if operation == "delete" and not remote_row_id:
+            return {"skip": True, "reason": "No remote UUID for delete", "operation": operation, "payload": {}, "remote_row_id": ""}
+
+        mapped_payload: Dict[str, Any] = {}
+        for column_name, raw_value in payload.items():
+            if column_name not in allowed_columns:
+                continue
+            normalized_value = self._normalize_supabase_value(column_name, raw_value)
+            mapped_payload[column_name] = self._map_supabase_foreign_key(table_name, column_name, normalized_value)
+
+        if operation == "update" and not remote_row_id:
+            operation = "insert"
+
+        print("[SYNC] Payload after mapping:", json.dumps(mapped_payload, ensure_ascii=True, default=str))
+        return {
+            "skip": False,
+            "operation": operation,
+            "payload": mapped_payload,
+            "remote_row_id": remote_row_id,
+        }
 
     def get_sync_status(self) -> Dict[str, Any]:
         self.provider.execute("SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0")
@@ -516,6 +637,7 @@ class DatabaseService:
 
     def process_sync_queue(self, limit: int = 25) -> Dict[str, Any]:
         items = self._fetch_pending_sync_items(limit=limit)
+        items.sort(key=lambda row: (self.SYNC_PRIORITY.get(row["table_name"], 999), int(row["id"])))
         pending_count = len(items)
         print("[SYNC] Pending:", pending_count)
         if not items:
@@ -538,12 +660,25 @@ class DatabaseService:
                 print("[SYNC] Table:", item["table_name"])
                 print("[SYNC] Row:", item["row_id"])
                 payload = json.loads(item["payload"])
-                self._sync_transport.sync_item(
+                sync_item = self._build_supabase_sync_item(
                     table_name=item["table_name"],
                     row_id=item["row_id"],
                     operation=item["operation"],
                     payload=payload,
                 )
+                if sync_item["skip"]:
+                    self.mark_sync_item_synced(int(item["id"]))
+                    synced += 1
+                    continue
+                response_payload = self._sync_transport.sync_item(
+                    table_name=item["table_name"],
+                    row_id=sync_item["remote_row_id"] or None,
+                    operation=sync_item["operation"],
+                    payload=sync_item["payload"],
+                )
+                remote_uuid = response_payload.get("id", "") if isinstance(response_payload, dict) else ""
+                if remote_uuid:
+                    self._set_remote_uuid(item["table_name"], item["row_id"], str(remote_uuid))
                 self.mark_sync_item_synced(int(item["id"]))
                 synced += 1
                 last_synced_at = self._now()
