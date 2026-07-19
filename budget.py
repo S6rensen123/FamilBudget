@@ -183,6 +183,7 @@ class FamilBudgetApp(tk.Tk):
         self.configure(bg="#F8FAFC")
 
         self.service = DatabaseService()
+        print("[SYNC] Status:", self.service.get_sync_status())
         self.current_user = None
         self.current_user_id = None
         self.session_token = ""
@@ -329,6 +330,34 @@ class FamilBudgetApp(tk.Tk):
         last_synced_at = status["last_synced_at"] if status["last_synced_at"] else "-"
         self.last_synced_var.set(f"Sidst synkroniseret: {last_synced_at}")
 
+    def show_sync_debug(self):
+        report = self.service.get_sync_debug_report()
+
+        def build_content(body):
+            header = tk.Frame(body, bg=self.colors["surface"])
+            header.pack(fill="x", pady=(4, 10))
+            for label, value in [
+                ("Pending items", str(report["pending_count"])),
+                ("Synced items", str(report["synced_count"])),
+                ("Failed items", str(report["failed_count"])),
+                ("Last sync time", report["last_sync_time"] or "-"),
+                ("Last error", report["last_error"] or "-"),
+            ]:
+                row = tk.Frame(header, bg=self.colors["surface"])
+                row.pack(fill="x", pady=2)
+                tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+                tk.Label(row, text=value, bg=self.colors["surface"], fg=self.colors["text"], wraplength=320, justify="right").pack(side="right")
+
+            tk.Label(body, text="Queue items", bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(8, 4))
+            for item in report["items"]:
+                frame = tk.Frame(body, bg=self.colors["surface_2"], highlightthickness=1, highlightbackground=self.colors["border"])
+                frame.pack(fill="x", pady=4)
+                tk.Label(frame, text=f"{item['table_name']} #{item['row_id']}", bg=self.colors["surface_2"], fg=self.colors["text"], font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
+                tk.Label(frame, text=f"Op: {item['operation']} • Synced: {item['synced']} • Retries: {item['retry_count']}", bg=self.colors["surface_2"], fg=self.colors["muted"]).pack(anchor="w", padx=10, pady=1)
+                tk.Label(frame, text=f"Error: {item['last_error'] or '-'}", bg=self.colors["surface_2"], fg=self.colors["danger"]).pack(anchor="w", padx=10, pady=(1, 8))
+
+        self.show_modal_panel("Sync Debug", build_content, width=440)
+
     def sync_pending_changes(self, force=False):
         if self.sync_in_progress and not force:
             self._sync_timer_id = self.after(10000, self.sync_pending_changes)
@@ -348,6 +377,9 @@ class FamilBudgetApp(tk.Tk):
                 self.sync_in_progress = False
                 status = self.service.get_sync_status()
                 self.refresh_sync_status()
+                print("[SYNC] Queue count:", result.get("pending_count", result.get("processed", 0)))
+                print("[SYNC] Synced:", result.get("synced", 0))
+                print("[SYNC] Last error:", result.get("last_error", ""))
                 if status["has_transport"] and result.get("failed", 0) > 0 and result.get("synced", 0) == 0:
                     self.sync_status_var.set("Sync: fejl")
                 if result.get("last_synced_at"):
@@ -728,6 +760,9 @@ class FamilBudgetApp(tk.Tk):
         self.retry_sync_button = tk.Button(sync_frame, text="Synk nu", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=6, relief="flat", command=lambda: self.sync_pending_changes(force=True))
         self.retry_sync_button.pack(anchor="e", pady=(4, 0))
         self.bind_hover(self.retry_sync_button, self.colors["surface_2"], self.colors["chip"])
+        self.sync_debug_button = tk.Button(sync_frame, text="Vis Sync Debug", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=6, relief="flat", command=self.show_sync_debug)
+        self.sync_debug_button.pack(anchor="e", pady=(4, 0))
+        self.bind_hover(self.sync_debug_button, self.colors["surface_2"], self.colors["chip"])
 
         self.canvas_frame = tk.Frame(self.main_frame, bg=self.colors["background"])
         self.canvas_frame.grid(row=1, column=0, sticky="nsew")

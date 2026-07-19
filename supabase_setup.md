@@ -9,6 +9,7 @@
 SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 SUPABASE_PUBLISHABLE_KEY=eyJ...
 SUPABASE_SECRET_KEY=sb_secret_...
+SUPABASE_JWKS_URL=https://YOUR_PROJECT.supabase.co/auth/v1/.well-known/jwks.json
 ```
 
 > `.env` er ignoreret i Git via [.gitignore](C:/Users/Shawn/Desktop/software/.gitignore).
@@ -22,6 +23,7 @@ SUPABASE_SECRET_KEY=sb_secret_...
   - migrations
   - backend scripts
   - admin-værktøjer
+- `SUPABASE_JWKS_URL` bruges til server-side JWT-verificering
 
 Konfiguration læses i [config.py](C:/Users/Shawn/Desktop/software/config.py).
 Hvis en påkrævet variabel mangler, kastes en tydelig `ConfigError`.
@@ -45,6 +47,7 @@ Sæt følgende i repository secrets:
 - `SUPABASE_URL`
 - `SUPABASE_PUBLISHABLE_KEY`
 - `SUPABASE_SECRET_KEY`
+- `SUPABASE_JWKS_URL`
 
 ### Eksempel brug i GitHub Actions
 

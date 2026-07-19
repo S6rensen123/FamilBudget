@@ -28,6 +28,10 @@ def get_supabase_secret_key() -> str:
     return _require_env("SUPABASE_SECRET_KEY")
 
 
+def get_supabase_jwks_url() -> str:
+    return _require_env("SUPABASE_JWKS_URL")
+
+
 def get_supabase_desktop_config() -> Dict[str, str]:
     return {
         "project_url": get_supabase_url(),
@@ -40,4 +44,5 @@ def get_supabase_admin_config() -> Dict[str, str]:
         "project_url": get_supabase_url(),
         "publishable_key": get_supabase_publishable_key(),
         "secret_key": get_supabase_secret_key(),
+        "jwks_url": get_supabase_jwks_url(),
     }
