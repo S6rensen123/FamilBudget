@@ -205,6 +205,9 @@ class FamilBudgetApp(tk.Tk):
         self.household = None
         self.dashboard_cards = []
         self._dashboard_data_cache = {"savings_goals": [], "subscriptions": [], "loaded_at": 0.0}
+        self._dashboard_loading = False
+        self._transactions_loading = False
+        self._notifications_loading = False
         self._last_rendered_page = None
         self._render_after_id = None
         self._resize_after_id = None
@@ -398,7 +401,7 @@ class FamilBudgetApp(tk.Tk):
     def start_main_app(self):
         self.clear_root()
         self.build_ui()
-        self.load_transactions()
+        self.load_transactions(callback=lambda: self.show_page(self.current_page, force=True))
         self.load_notifications()
         self.show_page(self.current_page, force=True)
         self.schedule_periodic_tasks()
@@ -880,27 +883,77 @@ class FamilBudgetApp(tk.Tk):
             "profil": "Profil",
         }[page]
  
-    def load_transactions(self):
+    def load_transactions(self, callback=None):
         started_at = time.perf_counter()
-        try:
-            self.transactions = self.service.load_transactions(self.current_user_id)
-        except Exception as exc:
-            messagebox.showerror("Fejl", f"Kunne ikke indlæse transaktioner: {exc}")
-            self.transactions = []
-        self._perf_log("load_transactions", started_at)
+        if self._transactions_loading:
+            return
+        self._transactions_loading = True
+        user_id = self.current_user_id
 
-    def load_notifications(self):
+        def worker():
+            worker_started_at = time.perf_counter()
+            try:
+                rows = self.service.load_transactions(user_id)
+            except Exception as exc:
+                def on_error():
+                    self._transactions_loading = False
+                    messagebox.showerror("Fejl", f"Kunne ikke indlæse transaktioner: {exc}")
+                    self.transactions = []
+                    if callback is not None:
+                        callback()
+                self.after(0, on_error)
+                return
+
+            def on_success():
+                self._transactions_loading = False
+                self.transactions = rows
+                if callback is not None:
+                    callback()
+                elif self.current_page in ("oversigt", "budget"):
+                    self.show_page(self.current_page, force=True)
+
+            self.after(0, on_success)
+            self._perf_log("load_transactions_worker", worker_started_at)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._perf_log("load_transactions_dispatch", started_at)
+
+    def load_notifications(self, callback=None):
         started_at = time.perf_counter()
-        try:
-            self.notifications = self.service.get_notifications(self.current_user_id)
-            self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
-            self.update_notification_badge()
-        except Exception as exc:
-            messagebox.showerror("Fejl", f"Kunne ikke indlæse notifikationer: {exc}")
-            self.notifications = []
-            self.alert_count = 0
-            self.update_notification_badge()
-        self._perf_log("load_notifications", started_at)
+        if self._notifications_loading:
+            return
+        self._notifications_loading = True
+        user_id = self.current_user_id
+
+        def worker():
+            worker_started_at = time.perf_counter()
+            try:
+                rows = self.service.get_notifications(user_id)
+            except Exception as exc:
+                def on_error():
+                    self._notifications_loading = False
+                    messagebox.showerror("Fejl", f"Kunne ikke indlæse notifikationer: {exc}")
+                    self.notifications = []
+                    self.alert_count = 0
+                    self.update_notification_badge()
+                    if callback is not None:
+                        callback()
+                self.after(0, on_error)
+                return
+
+            def on_success():
+                self._notifications_loading = False
+                self.notifications = rows
+                self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
+                self.update_notification_badge()
+                if callback is not None:
+                    callback()
+
+            self.after(0, on_success)
+            self._perf_log("load_notifications_worker", worker_started_at)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._perf_log("load_notifications_dispatch", started_at)
 
     def format_currency(self, value: float) -> str:
         return f"{value:,.2f} kr"
@@ -970,22 +1023,38 @@ class FamilBudgetApp(tk.Tk):
             self._perf_log("_load_dashboard_datasets_cached", started_at)
             return self._dashboard_data_cache["savings_goals"], self._dashboard_data_cache["subscriptions"]
 
-        savings_goals = []
-        subscriptions = []
-        try:
-            savings_goals = self.service.get_savings_goals(self.current_user_id)
-        except Exception:
-            savings_goals = []
-        try:
-            subscriptions = self.service.get_subscriptions(self.current_user_id)
-        except Exception:
-            subscriptions = []
+        if not self._dashboard_loading:
+            self._dashboard_loading = True
+            user_id = self.current_user_id
 
-        self._dashboard_data_cache["savings_goals"] = savings_goals
-        self._dashboard_data_cache["subscriptions"] = subscriptions
-        self._dashboard_data_cache["loaded_at"] = now
-        self._perf_log("_load_dashboard_datasets_db", started_at)
-        return savings_goals, subscriptions
+            def worker():
+                worker_started_at = time.perf_counter()
+                savings_goals = []
+                subscriptions = []
+                try:
+                    savings_goals = self.service.get_savings_goals(user_id)
+                except Exception:
+                    savings_goals = []
+                try:
+                    subscriptions = self.service.get_subscriptions(user_id)
+                except Exception:
+                    subscriptions = []
+
+                def on_success():
+                    self._dashboard_loading = False
+                    self._dashboard_data_cache["savings_goals"] = savings_goals
+                    self._dashboard_data_cache["subscriptions"] = subscriptions
+                    self._dashboard_data_cache["loaded_at"] = time.time()
+                    if self.current_page == "oversigt":
+                        self.show_page("oversigt", force=True)
+
+                self.after(0, on_success)
+                self._perf_log("_load_dashboard_datasets_worker", worker_started_at)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        self._perf_log("_load_dashboard_datasets_dispatch", started_at)
+        return self._dashboard_data_cache["savings_goals"], self._dashboard_data_cache["subscriptions"]
 
     def update_notification_badge(self):
         if hasattr(self, "notification_button"):
@@ -1449,20 +1518,39 @@ class FamilBudgetApp(tk.Tk):
 
     def refresh_notifications(self):
         started_at = time.perf_counter()
-        self.notifications = self.service.get_notifications(self.current_user_id)
-        self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
-        self.update_notification_badge()
-        now_ts = int(time.time())
-        last_status_ts = int(self.service.get_setting("last_budget_status_ts", "0") or "0")
-        if now_ts - last_status_ts >= 3600:
-            self.service.save_notification(
-                self.current_user_id,
-                "Budget status",
-                "Din saldo er stabil og klar til næste uge",
-                "info",
-            )
-            self.service.save_setting("last_budget_status_ts", str(now_ts))
-        self._perf_log("refresh_notifications", started_at)
+        user_id = self.current_user_id
+
+        def worker():
+            worker_started_at = time.perf_counter()
+            try:
+                rows = self.service.get_notifications(user_id)
+                now_ts = int(time.time())
+                last_status_ts = int(self.service.get_setting("last_budget_status_ts", "0") or "0")
+                if now_ts - last_status_ts >= 3600:
+                    self.service.save_notification(
+                        user_id,
+                        "Budget status",
+                        "Din saldo er stabil og klar til næste uge",
+                        "info",
+                    )
+                    self.service.save_setting("last_budget_status_ts", str(now_ts))
+                    rows = self.service.get_notifications(user_id)
+            except Exception as exc:
+                def on_error():
+                    messagebox.showerror("Fejl", f"Kunne ikke opdatere notifikationer: {exc}")
+                self.after(0, on_error)
+                return
+
+            def on_success():
+                self.notifications = rows
+                self.alert_count = sum(1 for notification in self.notifications if notification["read"] == 0)
+                self.update_notification_badge()
+
+            self.after(0, on_success)
+            self._perf_log("refresh_notifications_worker", worker_started_at)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._perf_log("refresh_notifications_dispatch", started_at)
 
     def save_notification(self, title, message, kind):
         self.service.save_notification(self.current_user_id, title, message, kind)
