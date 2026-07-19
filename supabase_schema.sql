@@ -101,6 +101,30 @@ create table if not exists public.notifications (
 );
 
 alter table if exists public.users
+  alter column id set default gen_random_uuid();
+
+do $$
+declare
+  dependency record;
+begin
+  for dependency in
+    select con.conname
+    from pg_constraint con
+    join pg_class rel on rel.oid = con.conrelid
+    join pg_namespace rel_ns on rel_ns.oid = rel.relnamespace
+    join pg_class ref on ref.oid = con.confrelid
+    join pg_namespace ref_ns on ref_ns.oid = ref.relnamespace
+    where rel_ns.nspname = 'public'
+      and rel.relname = 'users'
+      and con.contype = 'f'
+      and ref_ns.nspname = 'auth'
+      and ref.relname = 'users'
+  loop
+    execute format('alter table public.users drop constraint %I', dependency.conname);
+  end loop;
+end $$;
+
+alter table if exists public.users
   add column if not exists updated_at timestamptz not null default now();
 
 alter table if exists public.sessions

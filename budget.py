@@ -183,6 +183,7 @@ class FamilBudgetApp(tk.Tk):
         self.configure(bg="#F8FAFC")
 
         self.service = DatabaseService()
+        self.service.dump_sync_queue()
         print("[SYNC] Status:", self.service.get_sync_status())
         self.current_user = None
         self.current_user_id = None
@@ -347,6 +348,31 @@ class FamilBudgetApp(tk.Tk):
                 tk.Label(row, text=value, bg=self.colors["surface"], fg=self.colors["text"], wraplength=320, justify="right").pack(side="right")
 
         self.show_modal_panel("Sync Debug", build_content, width=440)
+
+    def dump_sync_queue(self):
+        dump_text = self.service.dump_sync_queue()
+
+        def build_content(body):
+            text_widget = tk.Text(
+                body,
+                height=18,
+                width=70,
+                wrap="word",
+                bg=self.colors["surface_2"],
+                fg=self.colors["text"],
+                bd=0,
+                relief="flat",
+            )
+            text_widget.pack(fill="both", expand=True)
+            text_widget.insert("1.0", dump_text)
+            text_widget.configure(state="disabled")
+
+        self.show_modal_panel("Dump Sync Queue", build_content, width=620)
+
+    def clear_failed_sync_items(self):
+        cleared_count = self.service.clear_failed_sync_items()
+        self.refresh_sync_status()
+        messagebox.showinfo("Sync Queue", f"Fjernede {cleared_count} fejlede sync-elementer.")
 
     def sync_pending_changes(self, force=False):
         if self.sync_in_progress and not force:
@@ -753,6 +779,9 @@ class FamilBudgetApp(tk.Tk):
         self.sync_debug_button = tk.Button(sync_frame, text="Vis Sync Debug", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=6, relief="flat", command=self.show_sync_debug)
         self.sync_debug_button.pack(anchor="e", pady=(4, 0))
         self.bind_hover(self.sync_debug_button, self.colors["surface_2"], self.colors["chip"])
+        self.dump_sync_queue_button = tk.Button(sync_frame, text="Dump Sync Queue", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=6, relief="flat", command=self.dump_sync_queue)
+        self.dump_sync_queue_button.pack(anchor="e", pady=(4, 0))
+        self.bind_hover(self.dump_sync_queue_button, self.colors["surface_2"], self.colors["chip"])
 
         self.canvas_frame = tk.Frame(self.main_frame, bg=self.colors["background"])
         self.canvas_frame.grid(row=1, column=0, sticky="nsew")

@@ -770,6 +770,18 @@ class DatabaseService:
             self.provider.commit()
 
     def _ensure_schema_columns(self) -> None:
+        self.provider.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_id_map (
+                table_name TEXT NOT NULL,
+                local_id TEXT NOT NULL,
+                remote_uuid TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, local_id)
+            )
+            """
+        )
         self._ensure_column("users", "updated_at", "updated_at TEXT")
         self._ensure_column("sessions", "device_name", "device_name TEXT")
         self._ensure_column("sessions", "platform", "platform TEXT")
@@ -813,6 +825,37 @@ class DatabaseService:
             return {}
         return {key: row[key] for key in row.keys()}
 
+    def _get_sync_mapped_uuid(self, table_name: str, local_id: Optional[str]) -> str:
+        if local_id in (None, ""):
+            return ""
+        self.provider.execute(
+            "SELECT remote_uuid FROM sync_id_map WHERE table_name = ? AND local_id = ?",
+            (table_name, local_id),
+        )
+        row = self.provider.fetchone()
+        return str(row["remote_uuid"]) if row is not None else ""
+
+    def _set_sync_mapped_uuid(self, table_name: str, local_id: Optional[str], remote_uuid: Optional[str]) -> None:
+        if local_id in (None, "") or remote_uuid in (None, ""):
+            return
+        timestamp = self._now()
+        self.provider.execute(
+            """
+            INSERT INTO sync_id_map (table_name, local_id, remote_uuid, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(table_name, local_id)
+            DO UPDATE SET remote_uuid = excluded.remote_uuid, updated_at = excluded.updated_at
+            """,
+            (table_name, local_id, remote_uuid, timestamp, timestamp),
+        )
+        self.provider.commit()
+
+    def _resolve_remote_uuid(self, table_name: str, local_id: Optional[str]) -> Optional[str]:
+        if local_id in (None, ""):
+            return None
+        mapped_uuid = self._get_sync_mapped_uuid(table_name, local_id)
+        return mapped_uuid or local_id
+
     def _normalize_supabase_value(self, column_name: str, value: Any) -> Any:
         if value in ("", None):
             return None if value == "" else value
@@ -836,14 +879,23 @@ class DatabaseService:
             if column_name not in allowed_columns:
                 continue
             normalized_value = self._normalize_supabase_value(column_name, raw_value)
+            if column_name in self.UUID_FOREIGN_KEYS.get(table_name, {}):
+                normalized_value = self._resolve_remote_uuid(
+                    self.UUID_FOREIGN_KEYS[table_name][column_name],
+                    str(normalized_value) if normalized_value is not None else None,
+                )
             mapped_payload[column_name] = normalized_value
+
+        remote_row_id = self._resolve_remote_uuid(table_name, row_id)
+        if "id" in mapped_payload and remote_row_id:
+            mapped_payload["id"] = remote_row_id
 
         print("[SYNC] Payload after mapping:", json.dumps(mapped_payload, ensure_ascii=True, default=str))
         return {
             "skip": False,
             "operation": operation,
             "payload": mapped_payload,
-            "remote_row_id": row_id or "",
+            "remote_row_id": remote_row_id or "",
         }
 
     def get_sync_status(self) -> Dict[str, Any]:
@@ -867,6 +919,42 @@ class DatabaseService:
             (limit,),
         )
         return list(self.provider.fetchall())
+
+    def dump_sync_queue(self) -> str:
+        self.provider.execute("SELECT * FROM sync_queue WHERE synced = 0 ORDER BY id ASC")
+        rows = list(self.provider.fetchall())
+        sections = ["[SYNC QUEUE]"]
+        if not rows:
+            sections.append("No pending items.")
+        for row in rows:
+            sections.extend(
+                [
+                    "--------------------------------",
+                    f"Queue ID: {row['id']}",
+                    f"Table: {row['table_name']}",
+                    f"Row ID: {row['row_id']}",
+                    f"Operation: {row['operation']}",
+                    f"Retry Count: {row['retry_count'] if 'retry_count' in row.keys() else 0}",
+                    f"Last Error: {row['last_error'] if 'last_error' in row.keys() and row['last_error'] else ''}",
+                    f"Payload: {row['payload'] if 'payload' in row.keys() else ''}",
+                    "--------------------------------",
+                ]
+            )
+        dump_text = "\n".join(sections)
+        print(dump_text)
+        return dump_text
+
+    def clear_failed_sync_items(self) -> int:
+        self.provider.execute(
+            "SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0 AND ((retry_count > 0) OR (last_error IS NOT NULL AND last_error != ''))"
+        )
+        row = self.provider.fetchone()
+        cleared_count = int(row["count"]) if row is not None else 0
+        self.provider.execute(
+            "DELETE FROM sync_queue WHERE synced = 0 AND ((retry_count > 0) OR (last_error IS NOT NULL AND last_error != ''))"
+        )
+        self.provider.commit()
+        return cleared_count
 
     def get_sync_debug_report(self, limit: int = 50) -> Dict[str, Any]:
         self.provider.execute("SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0")
@@ -991,6 +1079,12 @@ class DatabaseService:
                     operation=sync_item["operation"],
                     payload=sync_item["payload"],
                 )
+                local_row_id = str(item["row_id"]) if item["row_id"] not in (None, "") else str(payload.get("id", ""))
+                remote_uuid = ""
+                if isinstance(response_payload, dict):
+                    remote_uuid = str(response_payload.get("id", "") or "")
+                if local_row_id and remote_uuid:
+                    self._set_sync_mapped_uuid(str(item["table_name"]), local_row_id, remote_uuid)
                 self.mark_sync_item_synced(int(item["id"]))
                 synced += 1
                 last_synced_at = self._now()
