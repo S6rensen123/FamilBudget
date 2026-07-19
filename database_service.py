@@ -575,6 +575,71 @@ class DatabaseService:
             "member_count": member_count,
         }
 
+    def get_household_family_analysis(self, household_id: int) -> Dict[str, Any]:
+        self.provider.execute(
+            "SELECT user_id FROM household_members WHERE household_id = ?",
+            (household_id,),
+        )
+        member_rows = list(self.provider.fetchall())
+        member_ids = [int(row["user_id"]) for row in member_rows]
+        member_placeholders = ",".join("?" for _ in member_ids)
+        member_clause = f"user_id IN ({member_placeholders})" if member_ids else "0=1"
+
+        self.provider.execute(
+            f"SELECT kategori, type, beloeb FROM transactions WHERE household_id = ? OR {member_clause}",
+            (household_id, *member_ids),
+        )
+        tx_rows = list(self.provider.fetchall())
+        expense_totals: Dict[str, float] = {}
+        for row in tx_rows:
+            if row["type"] == "Indtægt":
+                continue
+            kategori = str(row["kategori"])
+            expense_totals[kategori] = expense_totals.get(kategori, 0.0) + float(row["beloeb"])
+
+        largest_category = "Ingen kategori"
+        if expense_totals:
+            largest_category = max(expense_totals.items(), key=lambda item: item[1])[0]
+
+        self.provider.execute(
+            f"SELECT name, amount FROM subscriptions WHERE active = 1 AND (household_id = ? OR {member_clause})",
+            (household_id, *member_ids),
+        )
+        sub_rows = list(self.provider.fetchall())
+        largest_subscription_name = "Ingen abonnement"
+        largest_subscription_amount = 0.0
+        if sub_rows:
+            largest_sub = max(sub_rows, key=lambda row: float(row["amount"]))
+            largest_subscription_name = str(largest_sub["name"])
+            largest_subscription_amount = float(largest_sub["amount"])
+
+        summary = self.get_household_financial_summary(household_id)
+        health_score = int(
+            max(
+                0,
+                min(
+                    100,
+                    round(
+                        100
+                        * (
+                            0.55 * (1.0 - (summary["expense"] / max(summary["income"], 1.0)))
+                            + 0.25 * (summary["savings"] / max(summary["income"], 1.0))
+                            + 0.20 * (1.0 - (summary["subscriptions"] / max(summary["income"], 1.0)))
+                            + (0.15 if summary["balance"] > 0 else 0.0)
+                        )
+                    ),
+                ),
+            )
+        )
+
+        return {
+            "largest_category": largest_category,
+            "largest_subscription_name": largest_subscription_name,
+            "largest_subscription_amount": largest_subscription_amount,
+            "potential_savings": summary["subscriptions"] * 0.25,
+            "health_score": health_score,
+        }
+
     def save_transaction(
         self,
         user_id: Optional[int],

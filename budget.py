@@ -142,7 +142,8 @@ class LoginWindow(tk.Toplevel):
             self.on_success(user, token)
             self.destroy()
         except Exception as exc:
-            messagebox.showerror("Fejl", f"Kunne ikke oprette konto: {exc}")
+            error_text = f"Kunne ikke oprette konto: {exc}"
+            messagebox.showerror("Fejl", error_text)
         finally:
             if self.winfo_exists():
                 self.set_loading(False)
@@ -163,7 +164,8 @@ class LoginWindow(tk.Toplevel):
             self.on_success(user, token)
             self.destroy()
         except Exception as exc:
-            messagebox.showerror("Fejl", f"Kunne ikke logge ind: {exc}")
+            error_text = f"Kunne ikke logge ind: {exc}"
+            messagebox.showerror("Fejl", error_text)
         finally:
             if self.winfo_exists():
                 self.set_loading(False)
@@ -543,7 +545,8 @@ class FamilBudgetApp(tk.Tk):
             try:
                 user_id = self.service.create_user(full_name, email, password)
             except Exception as exc:
-                messagebox.showerror("Fejl", f"Kunne ikke oprette konto: {exc}")
+                error_text = f"Kunne ikke oprette konto: {exc}"
+                messagebox.showerror("Fejl", error_text)
                 return
             user = self.service.get_user_by_id(user_id)
             self.current_user = user
@@ -938,9 +941,9 @@ class FamilBudgetApp(tk.Tk):
                 rows = self.service.load_transactions(user_id)
             except Exception as exc:
                 error_text = f"Kunne ikke indlæse transaktioner: {exc}"
-                def on_error():
+                def on_error(message=error_text):
                     self._transactions_loading = False
-                    messagebox.showerror("Fejl", error_text)
+                    messagebox.showerror("Fejl", message)
                     self.transactions = []
                     if callback is not None:
                         callback()
@@ -974,9 +977,9 @@ class FamilBudgetApp(tk.Tk):
                 rows = self.service.get_notifications(user_id)
             except Exception as exc:
                 error_text = f"Kunne ikke indlæse notifikationer: {exc}"
-                def on_error():
+                def on_error(message=error_text):
                     self._notifications_loading = False
-                    messagebox.showerror("Fejl", error_text)
+                    messagebox.showerror("Fejl", message)
                     self.notifications = []
                     self.alert_count = 0
                     self.update_notification_badge()
@@ -1186,7 +1189,8 @@ class FamilBudgetApp(tk.Tk):
             self._forecast_chart_image = tk.PhotoImage(file=tmp_path)
             tk.Label(card, image=self._forecast_chart_image, bg=self.colors["surface"]).pack(fill="x", padx=8, pady=(0, 8))
         except Exception as exc:
-            tk.Label(card, text=f"Kunne ikke generere graf: {exc}", bg=self.colors["surface"], fg=self.colors["danger"]).pack(anchor="w", padx=16, pady=8)
+            error_text = f"Kunne ikke generere graf: {exc}"
+            tk.Label(card, text=error_text, bg=self.colors["surface"], fg=self.colors["danger"]).pack(anchor="w", padx=16, pady=8)
         return card
 
     def render_dashboard(self):
@@ -1707,15 +1711,20 @@ class FamilBudgetApp(tk.Tk):
             tk.Label(row, text=item[1], bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
 
     def render_household_page(self):
-        card = self.create_card(self.canvas_content, "Husstand", "Sådan holder familien økonomien samlet")
-        card.pack(fill="x", padx=8, pady=(8, 8))
+        header = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        header.pack(fill="x", padx=8, pady=(8, 8))
+        tk.Label(header, text="👨‍👩‍👧‍👦 Husstand", bg=self.colors["background"], fg=self.colors["text"], font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(header, text="Komplet familieøkonomi samlet ét sted", bg=self.colors["background"], fg=self.colors["muted"]).pack(anchor="w")
+
         if not self.household_member or self.household is None:
+            card = self.create_card(self.canvas_content, "Husstand", "Opret eller tilslut en husstand")
+            card.pack(fill="x", padx=8, pady=(0, 8))
             tk.Label(card, text="Du er endnu ikke medlem af en husstand", bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(16, 8))
             tk.Label(card, text="Opret en ny husstand eller tilslut med en kode", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=(0, 16))
-            btn1 = tk.Button(card, text="Opret husstand", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=10, relief="flat", command=self.open_create_household_dialog)
-            btn1.pack(anchor="w", padx=16, pady=4)
-            btn2 = tk.Button(card, text="Tilslut med kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=12, pady=10, relief="flat", command=self.open_join_household_dialog)
-            btn2.pack(anchor="w", padx=16, pady=4)
+            actions = tk.Frame(card, bg=self.colors["surface"])
+            actions.pack(fill="x", padx=16, pady=(0, 16))
+            tk.Button(actions, text="Opret husstand", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=10, relief="flat", command=self.open_create_household_dialog).pack(side="left", padx=(0, 8))
+            tk.Button(actions, text="Tilslut med kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=12, pady=10, relief="flat", command=self.open_join_household_dialog).pack(side="left")
             return
 
         owner_id = self.household["owner_id"] if "owner_id" in self.household.keys() else None
@@ -1727,58 +1736,80 @@ class FamilBudgetApp(tk.Tk):
 
         members = self.service.get_household_members(self.household["id"])
         family_summary = self.service.get_household_financial_summary(self.household["id"])
+        family_analysis = self.service.get_household_family_analysis(self.household["id"])
 
-        tk.Label(card, text=self.household["name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 16, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
-        tk.Label(card, text=f"Administrator: {admin_name}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        tk.Label(card, text=f"Oprettet: {created_at}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        tk.Label(card, text=f"Invite kode: {self.household['invite_code']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=2)
-        tk.Label(card, text=f"Medlemmer: {len(members)}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w", padx=16, pady=(2, 12))
+        info_grid = tk.Frame(self.canvas_content, bg=self.colors["background"])
+        info_grid.pack(fill="x", padx=8, pady=(0, 8))
+        info_grid.columnconfigure(0, weight=1)
+        info_grid.columnconfigure(1, weight=1)
 
-        shared_stats = tk.Frame(card, bg=self.colors["surface"])
-        shared_stats.pack(fill="x", padx=16, pady=(0, 12))
-        for idx, (label, value, color) in enumerate([
+        info_card = self.create_card(info_grid, "Husstandsinformation")
+        info_card.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        for label, value in [
+            ("Husstandsnavn", self.household["name"]),
+            ("Administrator", admin_name),
+            ("Oprettelsesdato", created_at),
+            ("Invite kode", self.household["invite_code"]),
+            ("Antal medlemmer", str(len(members))),
+        ]:
+            row = tk.Frame(info_card, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+            tk.Label(row, text=value, bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        economy_card = self.create_card(info_grid, "Familieøkonomi")
+        economy_card.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
+        for label, value, color in [
             ("Fælles saldo", self.format_currency(float(family_summary["balance"])), self.colors["primary"]),
-            ("Fælles budget (udgifter)", self.format_currency(float(family_summary["expense"])), self.colors["danger"]),
             ("Fælles indtægter", self.format_currency(float(family_summary["income"])), self.colors["success"]),
-            ("Fælles opsparing", self.format_currency(float(family_summary["savings"])), self.colors["text"]),
+            ("Fælles udgifter", self.format_currency(float(family_summary["expense"])), self.colors["danger"]),
             ("Fælles abonnementer", self.format_currency(float(family_summary["subscriptions"])), self.colors["warning"]),
-        ]):
-            row = tk.Frame(shared_stats, bg=self.colors["surface"])
-            row.pack(fill="x", pady=2)
+            ("Fælles opsparing", self.format_currency(float(family_summary["savings"])), self.colors["text"]),
+        ]:
+            row = tk.Frame(economy_card, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=3)
             tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
             tk.Label(row, text=value, bg=self.colors["surface"], fg=color, font=("Segoe UI", 10, "bold")).pack(side="right")
 
-        actions = tk.Frame(card, bg=self.colors["surface"])
-        actions.pack(fill="x", padx=16, pady=(0, 12))
-        copy_btn = tk.Button(actions, text="Kopiér kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.copy_household_code)
-        copy_btn.pack(anchor="w", pady=2)
-        share_btn = tk.Button(actions, text="Del kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.share_household_code)
-        share_btn.pack(anchor="w", pady=2)
-        leave_btn = tk.Button(actions, text="Forlad husstand", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.leave_household)
-        leave_btn.pack(anchor="w", pady=2)
+        action_card = self.create_card(self.canvas_content, "Handlinger")
+        action_card.pack(fill="x", padx=8, pady=(0, 8))
+        action_row = tk.Frame(action_card, bg=self.colors["surface"])
+        action_row.pack(fill="x", padx=16, pady=(8, 12))
+        tk.Button(action_row, text="Kopiér kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=8, relief="flat", command=self.copy_household_code).pack(side="left", padx=(0, 8), pady=2)
+        tk.Button(action_row, text="Del kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=8, relief="flat", command=self.share_household_code).pack(side="left", padx=(0, 8), pady=2)
+        tk.Button(action_row, text="Generér ny kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=8, relief="flat", command=self.regenerate_household_code).pack(side="left", padx=(0, 8), pady=2)
+        tk.Button(action_row, text="Forlad husstand", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=8, relief="flat", command=self.leave_household).pack(side="left", padx=(0, 8), pady=2)
         if self.is_current_user_household_admin():
-            regenerate_btn = tk.Button(actions, text="Generér ny kode", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=8, relief="flat", command=self.regenerate_household_code)
-            regenerate_btn.pack(anchor="w", pady=2)
-            delete_btn = tk.Button(actions, text="Slet husstand", bg=self.colors["danger"], fg="white", bd=0, padx=8, pady=8, relief="flat", command=self.delete_household)
-            delete_btn.pack(anchor="w", pady=2)
+            tk.Button(action_row, text="Slet husstand", bg=self.colors["danger"], fg="white", bd=0, padx=10, pady=8, relief="flat", command=self.delete_household).pack(side="left", pady=2)
 
-        members_card = self.create_card(self.canvas_content, "Medlemmer", "Medlemmerne er samlet i moderne profiler")
+        family_card = self.create_card(self.canvas_content, "AI Familieanalyse", "Automatisk indsigt fra familieøkonomien")
+        family_card.pack(fill="x", padx=8, pady=(0, 8))
+        for label, value in [
+            ("Største udgiftskategori", family_analysis["largest_category"]),
+            ("Største abonnement", f"{family_analysis['largest_subscription_name']} ({self.format_currency(float(family_analysis['largest_subscription_amount']))})"),
+            ("Potentiel besparelse", self.format_currency(float(family_analysis["potential_savings"]))),
+            ("Økonomisk sundhed", f"{family_analysis['health_score']}/100"),
+        ]:
+            row = tk.Frame(family_card, bg=self.colors["surface"])
+            row.pack(fill="x", padx=16, pady=3)
+            tk.Label(row, text=label, bg=self.colors["surface"], fg=self.colors["muted"]).pack(side="left")
+            tk.Label(row, text=value, bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 10, "bold")).pack(side="right")
+
+        members_card = self.create_card(self.canvas_content, "Medlemmer", "Navn, e-mail og rolle for alle medlemmer")
         members_card.pack(fill="x", padx=8, pady=(0, 8))
         for member in members:
-            row = tk.Frame(members_card, bg=self.colors["surface"])
-            row.pack(fill="x", padx=16, pady=8)
+            row = tk.Frame(members_card, bg=self.colors["surface"], highlightthickness=1, highlightbackground=self.colors["border"])
+            row.pack(fill="x", padx=16, pady=6)
             info = tk.Frame(row, bg=self.colors["surface"])
-            info.pack(side="left", fill="x", expand=True)
+            info.pack(side="left", fill="x", expand=True, padx=10, pady=8)
             tk.Label(info, text=member["full_name"], bg=self.colors["surface"], fg=self.colors["text"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
-            tk.Label(info, text=f"{member['role']} • {member['email']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
+            tk.Label(info, text=f"{member['email']} • {member['role']}", bg=self.colors["surface"], fg=self.colors["muted"]).pack(anchor="w")
 
             if self.is_current_user_household_admin() and member["user_id"] != self.current_user_id:
                 actions_frame = tk.Frame(row, bg=self.colors["surface"])
-                actions_frame.pack(side="right")
-                role_btn = tk.Button(actions_frame, text="Skift rolle", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=6, pady=6, relief="flat", command=lambda u=member["user_id"], r=member["role"]: self.open_change_member_role_dialog(u, r))
-                role_btn.pack(side="left", padx=4)
-                remove_btn = tk.Button(actions_frame, text="Fjern", bg=self.colors["danger"], fg="white", bd=0, padx=6, pady=6, relief="flat", command=lambda u=member["user_id"]: self.remove_household_member(u))
-                remove_btn.pack(side="left", padx=4)
+                actions_frame.pack(side="right", padx=10, pady=8)
+                tk.Button(actions_frame, text="Skift rolle", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=8, pady=6, relief="flat", command=lambda u=member["user_id"], r=member["role"]: self.open_change_member_role_dialog(u, r)).pack(side="left", padx=4)
+                tk.Button(actions_frame, text="Fjern medlem", bg=self.colors["danger"], fg="white", bd=0, padx=8, pady=6, relief="flat", command=lambda u=member["user_id"]: self.remove_household_member(u)).pack(side="left", padx=4)
 
     def open_create_household_dialog(self):
         def build_content(body):
@@ -1969,7 +2000,8 @@ class FamilBudgetApp(tk.Tk):
                     self.show_page("profil")
                     messagebox.showinfo("Opdateret", "Dit navn er opdateret.")
                 except Exception as exc:
-                    messagebox.showerror("Fejl", f"Kunne ikke opdatere navn: {exc}")
+                    error_text = f"Kunne ikke opdatere navn: {exc}"
+                    messagebox.showerror("Fejl", error_text)
 
             tk.Button(body, text="Gem", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=10, relief="flat", command=save).pack(fill="x", pady=(16, 0))
 
@@ -1993,7 +2025,8 @@ class FamilBudgetApp(tk.Tk):
                     self.show_page("profil")
                     messagebox.showinfo("Opdateret", "Din e-mail er opdateret.")
                 except Exception as exc:
-                    messagebox.showerror("Fejl", f"Kunne ikke opdatere e-mail: {exc}")
+                    error_text = f"Kunne ikke opdatere e-mail: {exc}"
+                    messagebox.showerror("Fejl", error_text)
 
             tk.Button(body, text="Gem", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=10, relief="flat", command=save).pack(fill="x", pady=(16, 0))
 
@@ -2030,7 +2063,8 @@ class FamilBudgetApp(tk.Tk):
                     self.close_active_panel()
                     messagebox.showinfo("Opdateret", "Dit password er opdateret.")
                 except Exception as exc:
-                    messagebox.showerror("Fejl", f"Kunne ikke opdatere password: {exc}")
+                    error_text = f"Kunne ikke opdatere password: {exc}"
+                    messagebox.showerror("Fejl", error_text)
 
             tk.Button(body, text="Gem password", bg=self.colors["primary"], fg="white", bd=0, padx=12, pady=10, relief="flat", command=save).pack(fill="x", pady=(16, 0))
 
@@ -2050,7 +2084,8 @@ class FamilBudgetApp(tk.Tk):
             self.show_page("profil")
             messagebox.showinfo("Avatar opdateret", "Din avatar er gemt.")
         except Exception as exc:
-            messagebox.showerror("Fejl", f"Kunne ikke opdatere avatar: {exc}")
+            error_text = f"Kunne ikke opdatere avatar: {exc}"
+            messagebox.showerror("Fejl", error_text)
 
     def create_card(self, parent, title, subtitle=""):
         card = tk.Frame(parent, bg=self.colors["surface"], highlightthickness=1, highlightbackground=self.colors["border"])
@@ -2277,8 +2312,8 @@ class FamilBudgetApp(tk.Tk):
                     rows = self.service.get_notifications(user_id)
             except Exception as exc:
                 error_text = f"Kunne ikke opdatere notifikationer: {exc}"
-                def on_error():
-                    messagebox.showerror("Fejl", error_text)
+                def on_error(message=error_text):
+                    messagebox.showerror("Fejl", message)
                 self.after(0, on_error)
                 return
 
