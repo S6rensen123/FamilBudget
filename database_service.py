@@ -2,6 +2,7 @@ import sqlite3
 import uuid
 import os
 import json
+import shutil
 from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -269,6 +270,12 @@ class DatabaseService:
         print("[ENV] SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
         provider_config = provider_config or {}
         self.provider_name = provider_name
+        self._last_uuid_migration_report: Dict[str, Any] = {
+            "backup_path": "",
+            "migrated_rows": {},
+            "orphaned_references": [],
+            "failed_mappings": [],
+        }
         if provider_name == "sqlite":
             self.provider = SQLiteProvider(database_path)
         elif provider_name == "supabase":
@@ -514,9 +521,65 @@ class DatabaseService:
             payload[column_name] = self._remap_legacy_value(target_table, payload.get(column_name), id_maps)
         return json.dumps(payload, ensure_ascii=True)
 
+    def _create_uuid_migration_backup(self) -> str:
+        if not isinstance(self.provider, SQLiteProvider):
+            return ""
+        source_path = Path(self.provider.database_path)
+        if not source_path.exists():
+            return ""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = source_path.with_name(f"{source_path.stem}.pre_uuid_backup_{timestamp}{source_path.suffix}")
+        shutil.copy2(source_path, backup_path)
+        return str(backup_path)
+
+    def _store_id_migration_map(self, id_maps: Dict[str, Dict[str, str]]) -> None:
+        self.provider.execute(
+            """
+            CREATE TABLE IF NOT EXISTS id_migration_map (
+                table_name TEXT NOT NULL,
+                old_id TEXT NOT NULL,
+                new_id TEXT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                PRIMARY KEY (table_name, old_id)
+            )
+            """
+        )
+        if not id_maps:
+            self.provider.commit()
+            return
+        self.provider.execute("DELETE FROM id_migration_map")
+        migrated_at = self._now()
+        for table_name, mappings in id_maps.items():
+            for old_id, new_id in mappings.items():
+                self.provider.execute(
+                    "INSERT INTO id_migration_map (table_name, old_id, new_id, migrated_at) VALUES (?, ?, ?, ?)",
+                    (table_name, old_id, new_id, migrated_at),
+                )
+        self.provider.commit()
+
+    def _build_existing_id_maps(self) -> Dict[str, Dict[str, str]]:
+        id_maps: Dict[str, Dict[str, str]] = {table_name: {} for table_name in self.UUID_TABLES}
+        for table_name in self.UUID_TABLES:
+            if not self.provider.table_exists(table_name):
+                continue
+            self.provider.execute(f"SELECT id FROM {table_name}")
+            for row in self.provider.fetchall():
+                row_id = row["id"] if "id" in row.keys() else None
+                if row_id is not None:
+                    id_maps[table_name][str(row_id)] = str(row_id)
+        return id_maps
+
     def _migrate_integer_ids_to_uuid(self) -> None:
         if not self._needs_uuid_migration():
             self._create_uuid_schema()
+            current_id_maps = self._build_existing_id_maps()
+            self._store_id_migration_map(current_id_maps)
+            self._last_uuid_migration_report = {
+                "backup_path": "",
+                "migrated_rows": {table_name: len(mappings) for table_name, mappings in current_id_maps.items()},
+                "orphaned_references": [],
+                "failed_mappings": [],
+            }
             if self.provider.table_exists("sync_id_map"):
                 self.provider.execute("DROP TABLE sync_id_map")
                 self.provider.commit()
@@ -524,6 +587,7 @@ class DatabaseService:
 
         id_maps: Dict[str, Dict[str, str]] = {table_name: {} for table_name in self.UUID_TABLES}
         existing_rows: Dict[str, List[sqlite3.Row]] = {}
+        backup_path = self._create_uuid_migration_backup()
         for table_name in self.UUID_TABLES:
             if not self.provider.table_exists(table_name):
                 existing_rows[table_name] = []
@@ -535,6 +599,12 @@ class DatabaseService:
                 row_id = row["id"] if "id" in row.keys() else None
                 if row_id is not None:
                     id_maps[table_name][str(row_id)] = str(row_id) if "-" in str(row_id) else self._new_uuid()
+        self._last_uuid_migration_report = {
+            "backup_path": backup_path,
+            "migrated_rows": {table_name: len(mappings) for table_name, mappings in id_maps.items()},
+            "orphaned_references": [],
+            "failed_mappings": [],
+        }
 
         temp_suffix = "__uuid_migration"
         self.provider.execute("PRAGMA foreign_keys = OFF")
@@ -691,6 +761,7 @@ class DatabaseService:
                     self.provider.execute(f"DROP TABLE {table_name}")
             for table_name in self.UUID_TABLES + ("sync_queue",):
                 self.provider.execute(f"ALTER TABLE {table_name}{temp_suffix} RENAME TO {table_name}")
+            self._store_id_migration_map(id_maps)
             if self.provider.table_exists("sync_id_map"):
                 self.provider.execute("DROP TABLE sync_id_map")
             self.provider.commit()
@@ -852,6 +923,18 @@ class DatabaseService:
             "last_error": last_error,
             "items": items,
         }
+
+    def get_uuid_migration_report(self) -> Dict[str, Any]:
+        report = dict(self._last_uuid_migration_report)
+        if self.provider.table_exists("id_migration_map"):
+            self.provider.execute(
+                "SELECT table_name, COUNT(*) as count FROM id_migration_map GROUP BY table_name ORDER BY table_name"
+            )
+            report["migrated_rows"] = {
+                str(row["table_name"]): int(row["count"])
+                for row in self.provider.fetchall()
+            }
+        return report
 
     def mark_sync_item_synced(self, queue_id: int) -> None:
         self.provider.execute(
