@@ -1,0 +1,5 @@
+bcrypt
+requests
+black
+flake8
+pyinstaller

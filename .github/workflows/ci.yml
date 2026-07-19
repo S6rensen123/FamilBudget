@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: python -m compileall .
+
+      - name: SQLite smoke tests (login/sessions/transactions/notifications)
+        run: |
+          python -c "import tempfile; from pathlib import Path; from database_service import DatabaseService; db_path = Path(tempfile.mkdtemp()) / 'ci.db'; service = DatabaseService(database_path=str(db_path)); user_id = service.create_user('CI User', 'ci@example.com', 'Secret123!'); ok_user = service.login_user('ci@example.com', 'Secret123!'); assert ok_user is not None and int(ok_user['id']) == user_id; bad_user = service.login_user('ci@example.com', 'WrongPassword'); assert bad_user is None; token = service.create_session(user_id); assert service.validate_session(token) is not None; service.logout_user(token); assert service.validate_session(token) is None; service.save_transaction(user_id, '2026-07-01', 'Mad', 499.95, 'Udgift'); service.save_transaction(user_id, '2026-07-02', 'Løn', 25000.00, 'Indtægt'); tx = service.get_transactions(user_id); assert len(tx) >= 2; service.save_notification(user_id, 'CI Notice', 'Smoke test message', 'info'); notes = service.get_notifications(user_id); assert len(notes) >= 1; service.close(); print('ci-smoke-ok')"
+
+  quality:
+    name: Quality (black + flake8)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run black check
+        run: black --check .
+
+      - name: Run flake8
+        run: flake8 .

@@ -1,9 +1,9 @@
-name: Build and publish release
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -11,30 +11,44 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-      - name: Build release package
+      - name: Read app version
+        id: app_version
+        shell: bash
         run: |
-          python release/build_release.py
+          VERSION=$(python -c "from version import APP_VERSION; print(APP_VERSION)")
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release assets
+      - name: Build FamilBudget.exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name FamilBudget budget.py
+
+      - name: Create GitHub Release and upload exe
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            FamilBudget release
+
+            - Tag: ${{ github.ref_name }}
+            - Version (version.py): ${{ steps.app_version.outputs.value }}
           files: |
-            release/artifacts/FamilBudget-v*.zip
-            release/artifacts/FamilBudget-v*/budget.exe
-            release/artifacts/FamilBudget-v*/BudgetManagerSetup.exe
+            dist/FamilBudget.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
