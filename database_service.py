@@ -2,12 +2,16 @@ import sqlite3
 import uuid
 import os
 import json
+from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
+from dotenv import load_dotenv
 from config import get_supabase_desktop_config
+
+load_dotenv()
 
 
 class DatabaseProvider(ABC):
@@ -175,22 +179,22 @@ class SupabaseRestSyncTransport:
         def request(method: str, request_url: str, body: Optional[Dict[str, Any]] = None) -> None:
             data = None if body is None else json.dumps(body).encode("utf-8")
             req = urllib.request.Request(request_url, data=data, headers=headers, method=method)
-            print("[SYNC] Request URL:", request_url)
+            print("[SYNC] URL:", request_url)
             if body is not None:
                 print("[SYNC] Body:", json.dumps(body, ensure_ascii=True))
             try:
                 with urllib.request.urlopen(req, timeout=20) as response:
                     response_body = response.read().decode("utf-8", errors="replace")
-                    print("[SYNC] Status code:", response.status)
+                    print("[SYNC] Status:", response.status)
                     print("[SYNC] Body:", response_body)
             except urllib.error.HTTPError as exc:
                 error_body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-                print("[SYNC] Status code:", exc.code)
+                print("[SYNC] Status:", exc.code)
                 print("[SYNC] Body:", error_body)
-                print("[SYNC ERROR]", repr(exc))
+                print("[SYNC ERROR]", str(exc))
                 raise RuntimeError(f"Supabase sync HTTP error for {table_name}: {exc.code} {exc.reason}") from exc
             except urllib.error.URLError as exc:
-                print("[SYNC ERROR]", repr(exc))
+                print("[SYNC ERROR]", str(exc))
                 raise RuntimeError(f"Supabase sync connection error for {table_name}: {exc.reason}") from exc
 
         if operation == "insert":
@@ -214,6 +218,9 @@ class DatabaseService:
         provider_name: str = "sqlite",
         provider_config: Optional[Dict[str, Any]] = None,
     ) -> None:
+        print("[ENV] Current working directory:", os.getcwd())
+        print("[ENV] .env exists:", Path(".env").exists())
+        print("[ENV] SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
         provider_config = provider_config or {}
         self.provider_name = provider_name
         if provider_name == "sqlite":
@@ -229,9 +236,10 @@ class DatabaseService:
         else:
             raise ValueError(f"Unsupported provider: {provider_name}")
 
-        supabase_url_loaded = "yes" if os.getenv("SUPABASE_URL", "").strip() else "no"
-        print("[DB] Provider:", provider_name)
-        print("[DB] SUPABASE_URL loaded:", supabase_url_loaded)
+        supabase_url_loaded = bool(os.getenv("SUPABASE_URL", "").strip())
+        current_provider = provider_name
+        print("[DB] Provider:", current_provider)
+        print("[DB] Supabase URL loaded:", supabase_url_loaded)
         self._sync_transport = None
 
         supabase_url = os.getenv("SUPABASE_URL", "").strip()
@@ -509,7 +517,7 @@ class DatabaseService:
     def process_sync_queue(self, limit: int = 25) -> Dict[str, Any]:
         items = self._fetch_pending_sync_items(limit=limit)
         pending_count = len(items)
-        print("[SYNC] Pending count:", pending_count)
+        print("[SYNC] Pending:", pending_count)
         if not items:
             return {"processed": 0, "synced": 0, "failed": 0, "last_error": "", "last_synced_at": self.get_sync_status()["last_synced_at"], "pending_count": pending_count}
 
@@ -527,7 +535,7 @@ class DatabaseService:
         for item in items:
             processed += 1
             try:
-                print("[SYNC] Table name:", item["table_name"])
+                print("[SYNC] Table:", item["table_name"])
                 print("[SYNC] Row:", item["row_id"])
                 payload = json.loads(item["payload"])
                 self._sync_transport.sync_item(
@@ -542,7 +550,7 @@ class DatabaseService:
             except Exception as exc:
                 failed += 1
                 last_error = str(exc)
-                print("[SYNC ERROR]", repr(exc))
+                print("[SYNC ERROR]", str(exc))
                 self.mark_sync_item_failed(int(item["id"]), last_error)
         print("[SYNC] Synced:", synced)
         print("[SYNC] Last error:", last_error)

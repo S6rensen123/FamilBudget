@@ -1,4 +1,5 @@
 bcrypt
+python-dotenv
 requests
 black
 flake8
