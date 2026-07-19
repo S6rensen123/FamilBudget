@@ -1,5 +1,7 @@
 import sqlite3
 import uuid
+import os
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -142,6 +144,59 @@ class SupabaseProvider(DatabaseProvider):
         self._unsupported()
 
 
+class SupabaseRestSyncTransport:
+    def __init__(self, project_url: str, secret_key: Optional[str] = None, access_key: Optional[str] = None) -> None:
+        self.project_url = project_url.rstrip("/")
+        self.secret_key = secret_key.strip() if secret_key else ""
+        self.access_key = access_key.strip() if access_key else ""
+
+    def _headers(self) -> Dict[str, str]:
+        key = self.secret_key or self.access_key
+        if not self.project_url or not key:
+            raise RuntimeError("Supabase sync transport mangler konfiguration.")
+        return {
+            "apikey": key,
+            "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+
+    def sync_item(self, table_name: str, row_id: Optional[int], operation: str, payload: Dict[str, Any]) -> None:
+        import urllib.error
+        import urllib.request
+
+        if not self.project_url:
+            raise RuntimeError("Supabase URL mangler.")
+
+        table = table_name.replace('"', "")
+        url = f"{self.project_url}/rest/v1/{table}"
+        headers = self._headers()
+
+        def request(method: str, request_url: str, body: Optional[Dict[str, Any]] = None) -> None:
+            data = None if body is None else json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(request_url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=20) as response:
+                    response.read()
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(f"Supabase sync HTTP error for {table_name}: {exc.code} {exc.reason}") from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Supabase sync connection error for {table_name}: {exc.reason}") from exc
+
+        if operation == "insert":
+            request("POST", url, payload)
+        elif operation == "update":
+            if row_id is None:
+                raise RuntimeError(f"Sync update mangler row_id for {table_name}.")
+            request("PATCH", f"{url}?id=eq.{row_id}", payload)
+        elif operation == "delete":
+            if row_id is None:
+                raise RuntimeError(f"Sync delete mangler row_id for {table_name}.")
+            request("DELETE", f"{url}?id=eq.{row_id}")
+        else:
+            raise RuntimeError(f"Ukendt sync operation: {operation}")
+
+
 class DatabaseService:
     def __init__(
         self,
@@ -162,6 +217,22 @@ class DatabaseService:
             self.provider = SupabaseProvider(**provider_config)
         else:
             raise ValueError(f"Unsupported provider: {provider_name}")
+
+        supabase_url_loaded = "yes" if os.getenv("SUPABASE_URL", "").strip() else "no"
+        print(f"[DB] Current provider: {self.provider.__class__.__name__.replace('Provider', '').lower()}")
+        print(f"[DB] SUPABASE_URL loaded: {supabase_url_loaded}")
+        self._sync_transport = None
+
+        supabase_url = os.getenv("SUPABASE_URL", "").strip()
+        publishable_key = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
+        allow_secret_sync = os.getenv("SUPABASE_SYNC_ALLOW_SECRET", "").strip() == "1"
+        secret_key = os.getenv("SUPABASE_SECRET_KEY", "").strip() if allow_secret_sync else ""
+        if supabase_url and publishable_key:
+            self._sync_transport = SupabaseRestSyncTransport(
+                supabase_url,
+                secret_key=secret_key,
+                access_key=publishable_key,
+            )
 
         self.init_db()
 
@@ -290,6 +361,22 @@ class DatabaseService:
             )
             """
         )
+        self.provider.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name TEXT NOT NULL,
+                row_id INTEGER,
+                operation TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                synced INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+            """
+        )
 
         self._ensure_column("transactions", "user_id", "user_id INTEGER")
         self._ensure_column("transactions", "household_id", "household_id INTEGER")
@@ -298,6 +385,97 @@ class DatabaseService:
         self._ensure_column("subscriptions", "household_id", "household_id INTEGER")
         self._ensure_column("savings_goals", "household_id", "household_id INTEGER")
         self.provider.commit()
+
+    def set_sync_transport(self, transport: Any) -> None:
+        self._sync_transport = transport
+
+    def enqueue_sync(self, table_name: str, row_id: Optional[int], operation: str, payload: Dict[str, Any]) -> int:
+        self.provider.execute(
+            "INSERT INTO sync_queue (table_name, row_id, operation, payload, created_at, synced) VALUES (?, ?, ?, ?, ?, 0)",
+            (table_name, row_id, operation, json.dumps(payload, ensure_ascii=True), self._now()),
+        )
+        self.provider.commit()
+        return int(self.provider.lastrowid())
+
+    def _row_to_payload(self, row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+        if row is None:
+            return {}
+        return {key: row[key] for key in row.keys()}
+
+    def get_sync_status(self) -> Dict[str, Any]:
+        self.provider.execute("SELECT COUNT(*) as count FROM sync_queue WHERE synced = 0")
+        pending_row = self.provider.fetchone()
+        pending = int(pending_row["count"]) if pending_row is not None else 0
+
+        self.provider.execute(
+            "SELECT synced_at FROM sync_queue WHERE synced = 1 ORDER BY synced_at DESC, id DESC LIMIT 1"
+        )
+        last_row = self.provider.fetchone()
+        return {
+            "pending": pending,
+            "last_synced_at": last_row["synced_at"] if last_row is not None else "",
+            "has_transport": self._sync_transport is not None,
+        }
+
+    def _fetch_pending_sync_items(self, limit: int = 25) -> List[sqlite3.Row]:
+        self.provider.execute(
+            "SELECT * FROM sync_queue WHERE synced = 0 ORDER BY id ASC LIMIT ?",
+            (limit,),
+        )
+        return list(self.provider.fetchall())
+
+    def mark_sync_item_synced(self, queue_id: int) -> None:
+        self.provider.execute(
+            "UPDATE sync_queue SET synced = 1, synced_at = ?, last_error = NULL WHERE id = ?",
+            (self._now(), queue_id),
+        )
+        self.provider.commit()
+
+    def mark_sync_item_failed(self, queue_id: int, error_message: str) -> None:
+        self.provider.execute(
+            "UPDATE sync_queue SET retry_count = retry_count + 1, last_error = ? WHERE id = ?",
+            (error_message[:500], queue_id),
+        )
+        self.provider.commit()
+
+    def process_sync_queue(self, limit: int = 25) -> Dict[str, Any]:
+        items = self._fetch_pending_sync_items(limit=limit)
+        if not items:
+            return {"processed": 0, "synced": 0, "failed": 0, "last_error": "", "last_synced_at": self.get_sync_status()["last_synced_at"]}
+
+        if self._sync_transport is None:
+            return {"processed": len(items), "synced": 0, "failed": len(items), "last_error": "No sync transport configured", "last_synced_at": self.get_sync_status()["last_synced_at"]}
+
+        processed = 0
+        synced = 0
+        failed = 0
+        last_error = ""
+        last_synced_at = self.get_sync_status()["last_synced_at"]
+
+        for item in items:
+            processed += 1
+            try:
+                payload = json.loads(item["payload"])
+                self._sync_transport.sync_item(
+                    table_name=item["table_name"],
+                    row_id=item["row_id"],
+                    operation=item["operation"],
+                    payload=payload,
+                )
+                self.mark_sync_item_synced(int(item["id"]))
+                synced += 1
+                last_synced_at = self._now()
+            except Exception as exc:
+                failed += 1
+                last_error = str(exc)
+                self.mark_sync_item_failed(int(item["id"]), last_error)
+        return {
+            "processed": processed,
+            "synced": synced,
+            "failed": failed,
+            "last_error": last_error,
+            "last_synced_at": last_synced_at,
+        }
 
     def get_setting(self, key: str, default: str = "") -> str:
         self.provider.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
@@ -332,6 +510,7 @@ class DatabaseService:
         return int(row["count"]) if row else 0
 
     def create_user(self, full_name: str, email: str, password: str, role: str = "user") -> int:
+        print(f"[DB] create_user called via {self.provider.__class__.__name__}")
         password_hash = self._hash_password(password)
         created_at = self._now()
         self.provider.execute(
@@ -339,7 +518,9 @@ class DatabaseService:
             (full_name.strip(), email.lower().strip(), password_hash, created_at, role),
         )
         self.provider.commit()
-        return int(self.provider.lastrowid())
+        user_id = int(self.provider.lastrowid())
+        self.enqueue_sync("users", user_id, "insert", self._row_to_payload(self.get_user_by_id(user_id)))
+        return user_id
 
     def login_user(self, email: str, password: str) -> Optional[sqlite3.Row]:
         user = self.get_user_by_email(email)
@@ -352,6 +533,7 @@ class DatabaseService:
             (self._now(), user["id"]),
         )
         self.provider.commit()
+        self.enqueue_sync("users", int(user["id"]), "update", self._row_to_payload(self.get_user_by_id(int(user["id"]))))
         return self.get_user_by_id(user["id"])
 
     def create_session(self, user_id: int, expires_in_hours: int = 30) -> str:
@@ -388,10 +570,12 @@ class DatabaseService:
     def update_user_email(self, user_id: int, email: str) -> None:
         self.provider.execute("UPDATE users SET email = ? WHERE id = ?", (email.lower().strip(), user_id))
         self.provider.commit()
+        self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def update_user_avatar(self, user_id: int, avatar_url: str) -> None:
         self.provider.execute("UPDATE users SET avatar_url = ? WHERE id = ?", (avatar_url, user_id))
         self.provider.commit()
+        self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def _generate_invite_code(self) -> str:
         return uuid.uuid4().hex[:8].upper()
@@ -406,6 +590,7 @@ class DatabaseService:
         household_id = int(self.provider.lastrowid())
         self.add_household_member(household_id, owner_id, "owner")
         self.provider.commit()
+        self.enqueue_sync("households", household_id, "insert", self._row_to_payload(self.get_household_by_code(invite_code)))
         return household_id, invite_code
 
     def add_household_member(self, household_id: int, user_id: int, role: str = "member") -> None:
@@ -420,6 +605,12 @@ class DatabaseService:
             (household_id, user_id, role),
         )
         self.provider.commit()
+        self.provider.execute(
+            "SELECT * FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, user_id),
+        )
+        member_row = self.provider.fetchone()
+        self.enqueue_sync("household_members", int(member_row["id"]) if member_row is not None else None, "insert", self._row_to_payload(member_row))
 
     def get_household_by_code(self, invite_code: str) -> Optional[sqlite3.Row]:
         self.provider.execute("SELECT * FROM households WHERE invite_code = ?", (invite_code.strip().upper(),))
@@ -432,6 +623,7 @@ class DatabaseService:
             (invite_code, household_id),
         )
         self.provider.commit()
+        self.enqueue_sync("households", household_id, "update", self._row_to_payload(self.get_household_by_code(invite_code)))
         return invite_code
 
     def join_household(self, user_id: int, invite_code: str) -> bool:
@@ -483,13 +675,25 @@ class DatabaseService:
             (new_role, household_id, target_user_id),
         )
         self.provider.commit()
+        self.provider.execute(
+            "SELECT * FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, target_user_id),
+        )
+        member_row = self.provider.fetchone()
+        self.enqueue_sync("household_members", int(member_row["id"]) if member_row is not None else None, "update", self._row_to_payload(member_row))
 
     def remove_household_member(self, household_id: int, target_user_id: int) -> None:
+        self.provider.execute(
+            "SELECT * FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, target_user_id),
+        )
+        payload_row = self.provider.fetchone()
         self.provider.execute(
             "DELETE FROM household_members WHERE household_id = ? AND user_id = ?",
             (household_id, target_user_id),
         )
         self.provider.commit()
+        self.enqueue_sync("household_members", None, "delete", self._row_to_payload(payload_row))
 
     def leave_household(self, household_id: int, user_id: int) -> None:
         self.provider.execute("SELECT owner_id FROM households WHERE id = ?", (household_id,))
@@ -521,10 +725,21 @@ class DatabaseService:
             (household_id, new_owner_id),
         )
         self.provider.commit()
+        self.provider.execute("SELECT * FROM households WHERE id = ?", (household_id,))
+        self.enqueue_sync("households", household_id, "update", self._row_to_payload(self.provider.fetchone()))
+        self.provider.execute(
+            "SELECT * FROM household_members WHERE household_id = ? AND user_id = ?",
+            (household_id, new_owner_id),
+        )
+        owner_member_row = self.provider.fetchone()
+        self.enqueue_sync("household_members", int(owner_member_row["id"]) if owner_member_row is not None else None, "update", self._row_to_payload(owner_member_row))
 
     def delete_household(self, household_id: int) -> None:
+        self.provider.execute("SELECT * FROM households WHERE id = ?", (household_id,))
+        payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM households WHERE id = ?", (household_id,))
         self.provider.commit()
+        self.enqueue_sync("households", household_id, "delete", self._row_to_payload(payload_row))
 
     def get_household_financial_summary(self, household_id: int) -> Dict[str, Any]:
         self.provider.execute(
@@ -667,7 +882,10 @@ class DatabaseService:
                 (dato, kategori.strip(), beloeb, type_.strip()),
             )
         self.provider.commit()
-        return int(self.provider.lastrowid())
+        row_id = int(self.provider.lastrowid())
+        self.provider.execute("SELECT * FROM transactions WHERE id = ?", (row_id,))
+        self.enqueue_sync("transactions", row_id, "insert", self._row_to_payload(self.provider.fetchone()))
+        return row_id
 
     def get_transactions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         has_user = self.provider.has_column("transactions", "user_id")
@@ -719,10 +937,15 @@ class DatabaseService:
                 (dato, kategori.strip(), beloeb, type_.strip(), transaction_id),
             )
         self.provider.commit()
+        self.provider.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,))
+        self.enqueue_sync("transactions", transaction_id, "update", self._row_to_payload(self.provider.fetchone()))
 
     def delete_transaction(self, transaction_id: int) -> None:
+        self.provider.execute("SELECT * FROM transactions WHERE id = ?", (transaction_id,))
+        payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
         self.provider.commit()
+        self.enqueue_sync("transactions", transaction_id, "delete", self._row_to_payload(payload_row))
 
     def get_notifications(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         has_user = self.provider.has_column("notifications", "user_id")
@@ -795,10 +1018,21 @@ class DatabaseService:
                     (title, message, kind, 0, self._now()),
                 )
             self.provider.commit()
+            if has_user and user_id is not None:
+                self.provider.execute(
+                    "SELECT * FROM notifications WHERE user_id = ? AND title = ? AND message = ? ORDER BY id DESC LIMIT 1",
+                    (user_id, title, message),
+                )
+                notif_row = self.provider.fetchone()
+                self.enqueue_sync("notifications", int(notif_row["id"]) if notif_row is not None else None, "insert", self._row_to_payload(notif_row))
 
     def mark_all_notifications_read(self, user_id: Optional[int] = None) -> None:
         if self.provider.has_column("notifications", "user_id") and user_id is not None:
+            self.provider.execute("SELECT * FROM notifications WHERE user_id = ? AND read = 0", (user_id,))
+            unread_rows = list(self.provider.fetchall())
             self.provider.execute("UPDATE notifications SET read = 1 WHERE user_id = ?", (user_id,))
+            for unread_row in unread_rows:
+                self.enqueue_sync("notifications", int(unread_row["id"]), "update", {**self._row_to_payload(unread_row), "read": 1})
         else:
             self.provider.execute("UPDATE notifications SET read = 1")
         self.provider.commit()
@@ -806,11 +1040,13 @@ class DatabaseService:
     def update_user_profile(self, user_id: int, full_name: str) -> None:
         self.provider.execute("UPDATE users SET full_name = ? WHERE id = ?", (full_name.strip(), user_id))
         self.provider.commit()
+        self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def change_password(self, user_id: int, new_password: str) -> None:
         password_hash = self._hash_password(new_password)
         self.provider.execute("UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id))
         self.provider.commit()
+        self.enqueue_sync("users", user_id, "update", self._row_to_payload(self.get_user_by_id(user_id)))
 
     def create_savings_goal(
         self,
@@ -825,7 +1061,10 @@ class DatabaseService:
             (user_id, household_id, title.strip(), target_amount, 0.0, due_date, self._now()),
         )
         self.provider.commit()
-        return int(self.provider.lastrowid())
+        goal_id = int(self.provider.lastrowid())
+        self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
+        self.enqueue_sync("savings_goals", goal_id, "insert", self._row_to_payload(self.provider.fetchone()))
+        return goal_id
 
     def get_savings_goals(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         if user_id is not None:
@@ -855,10 +1094,15 @@ class DatabaseService:
             (title.strip(), target_amount, current_amount, due_date, household_id, goal_id),
         )
         self.provider.commit()
+        self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
+        self.enqueue_sync("savings_goals", goal_id, "update", self._row_to_payload(self.provider.fetchone()))
 
     def delete_savings_goal(self, goal_id: int) -> None:
+        self.provider.execute("SELECT * FROM savings_goals WHERE id = ?", (goal_id,))
+        payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM savings_goals WHERE id = ?", (goal_id,))
         self.provider.commit()
+        self.enqueue_sync("savings_goals", goal_id, "delete", self._row_to_payload(payload_row))
 
     def create_subscription(
         self,
@@ -880,7 +1124,10 @@ class DatabaseService:
                 (user_id, name.strip(), amount, billing_date, 1 if active else 0, self._now()),
             )
         self.provider.commit()
-        return int(self.provider.lastrowid())
+        subscription_id = int(self.provider.lastrowid())
+        self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
+        self.enqueue_sync("subscriptions", subscription_id, "insert", self._row_to_payload(self.provider.fetchone()))
+        return subscription_id
 
     def get_subscriptions(self, user_id: Optional[int] = None) -> List[sqlite3.Row]:
         has_household = self.provider.has_column("subscriptions", "household_id")
@@ -920,10 +1167,15 @@ class DatabaseService:
                 (name.strip(), amount, billing_date, 1 if active else 0, subscription_id),
             )
         self.provider.commit()
+        self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
+        self.enqueue_sync("subscriptions", subscription_id, "update", self._row_to_payload(self.provider.fetchone()))
 
     def delete_subscription(self, subscription_id: int) -> None:
+        self.provider.execute("SELECT * FROM subscriptions WHERE id = ?", (subscription_id,))
+        payload_row = self.provider.fetchone()
         self.provider.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
         self.provider.commit()
+        self.enqueue_sync("subscriptions", subscription_id, "delete", self._row_to_payload(payload_row))
 
     def close(self) -> None:
         self.provider.close()

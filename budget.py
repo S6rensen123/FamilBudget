@@ -223,8 +223,12 @@ class FamilBudgetApp(tk.Tk):
         self._session_timer_id = None
         self._update_timer_id = None
         self._notify_timer_id = None
+        self._sync_timer_id = None
         self._last_resize_mode = None
         self._forecast_chart_image = None
+        self.sync_status_var = tk.StringVar(value="Sync: venter")
+        self.last_synced_var = tk.StringVar(value="Sidst synkroniseret: -")
+        self.sync_in_progress = False
 
         self.session_token = self.service.get_setting("session_token", "")
         if self.session_token:
@@ -256,7 +260,7 @@ class FamilBudgetApp(tk.Tk):
         print(f"[PERF] {function_name} {elapsed_ms:.2f} ms")
 
     def cancel_scheduled_jobs(self):
-        for timer_id_attr in ("_render_after_id", "_resize_after_id", "_session_timer_id", "_update_timer_id", "_notify_timer_id"):
+        for timer_id_attr in ("_render_after_id", "_resize_after_id", "_session_timer_id", "_update_timer_id", "_notify_timer_id", "_sync_timer_id"):
             timer_id = getattr(self, timer_id_attr, None)
             if timer_id is not None:
                 try:
@@ -281,10 +285,16 @@ class FamilBudgetApp(tk.Tk):
                 self.after_cancel(self._session_timer_id)
             except tk.TclError:
                 pass
+        if self._sync_timer_id is not None:
+            try:
+                self.after_cancel(self._sync_timer_id)
+            except tk.TclError:
+                pass
 
         self._notify_timer_id = self.after(800, self.refresh_notifications)
         self._update_timer_id = self.after(1200, self.start_update_check)
         self._session_timer_id = self.after(5 * 60 * 1000, self.ensure_session_valid)
+        self._sync_timer_id = self.after(2000, self.sync_pending_changes)
 
     def ensure_session_valid(self):
         started_at = time.perf_counter()
@@ -306,6 +316,48 @@ class FamilBudgetApp(tk.Tk):
         self.refresh_household_state()
         self.deiconify()
         self.start_main_app()
+
+    def refresh_sync_status(self):
+        status = self.service.get_sync_status()
+        if status["has_transport"]:
+            label = "Sync: klar"
+        else:
+            label = "Sync: lokal"
+        if status["pending"] > 0:
+            label = f"{label} ({status['pending']} ventende)"
+        self.sync_status_var.set(label)
+        last_synced_at = status["last_synced_at"] if status["last_synced_at"] else "-"
+        self.last_synced_var.set(f"Sidst synkroniseret: {last_synced_at}")
+
+    def sync_pending_changes(self, force=False):
+        if self.sync_in_progress and not force:
+            self._sync_timer_id = self.after(10000, self.sync_pending_changes)
+            return
+
+        self.sync_in_progress = True
+        self.sync_status_var.set("Sync: synkroniserer…")
+
+        def worker():
+            started_at = time.perf_counter()
+            try:
+                result = self.service.process_sync_queue()
+            except Exception as exc:
+                result = {"processed": 0, "synced": 0, "failed": 1, "last_error": str(exc), "last_synced_at": self.service.get_sync_status()["last_synced_at"]}
+
+            def on_done():
+                self.sync_in_progress = False
+                status = self.service.get_sync_status()
+                self.refresh_sync_status()
+                if status["has_transport"] and result.get("failed", 0) > 0 and result.get("synced", 0) == 0:
+                    self.sync_status_var.set("Sync: fejl")
+                if result.get("last_synced_at"):
+                    self.last_synced_var.set(f"Sidst synkroniseret: {result['last_synced_at']}")
+                self._perf_log("sync_pending_changes", started_at)
+                self._sync_timer_id = self.after(15000, self.sync_pending_changes)
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_household_state(self):
         if self.current_user_id is not None:
@@ -648,6 +700,7 @@ class FamilBudgetApp(tk.Tk):
         self.top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         self.top_bar.columnconfigure(0, weight=1)
         self.top_bar.columnconfigure(1, weight=0)
+        self.top_bar.columnconfigure(2, weight=0)
 
         self.app_title = tk.Label(self.top_bar, text="FamilBudget", font=("Segoe UI", 16, "bold"), bg=self.colors["surface"], fg=self.colors["text"])
         self.app_title.grid(row=0, column=0, sticky="w", padx=16, pady=12)
@@ -665,6 +718,16 @@ class FamilBudgetApp(tk.Tk):
         )
         self.notification_button.grid(row=0, column=1, sticky="e", padx=(0, 12), pady=12)
         self.bind_hover(self.notification_button, self.colors["surface_2"], self.colors["chip"])
+
+        sync_frame = tk.Frame(self.top_bar, bg=self.colors["surface"])
+        sync_frame.grid(row=0, column=2, sticky="e", padx=(0, 16), pady=10)
+        self.sync_status_label = tk.Label(sync_frame, textvariable=self.sync_status_var, bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 10, "bold"))
+        self.sync_status_label.pack(anchor="e")
+        self.last_synced_label = tk.Label(sync_frame, textvariable=self.last_synced_var, bg=self.colors["surface"], fg=self.colors["muted"], font=("Segoe UI", 8))
+        self.last_synced_label.pack(anchor="e")
+        self.retry_sync_button = tk.Button(sync_frame, text="Synk nu", bg=self.colors["surface_2"], fg=self.colors["text"], bd=0, padx=10, pady=6, relief="flat", command=lambda: self.sync_pending_changes(force=True))
+        self.retry_sync_button.pack(anchor="e", pady=(4, 0))
+        self.bind_hover(self.retry_sync_button, self.colors["surface_2"], self.colors["chip"])
 
         self.canvas_frame = tk.Frame(self.main_frame, bg=self.colors["background"])
         self.canvas_frame.grid(row=1, column=0, sticky="nsew")
@@ -729,6 +792,7 @@ class FamilBudgetApp(tk.Tk):
 
         self.update_sidebar_profile()
         self._apply_resize()
+        self.refresh_sync_status()
 
     def _on_mouse_wheel(self, event):
         if self.canvas is None:
