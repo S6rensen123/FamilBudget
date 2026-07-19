@@ -1,0 +1,7 @@
+{
+  "app_name": "FamilBudget",
+  "version": "1.0.0",
+  "repository": "your-org/familbudget",
+  "asset_name": "budget.exe",
+  "release_api_url": "https://api.github.com/repos/your-org/familbudget/releases/latest"
+}
