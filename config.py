@@ -16,33 +16,16 @@ def _require_env(name: str) -> str:
     return value
 
 
-def get_supabase_url() -> str:
-    return _require_env("SUPABASE_URL")
+def get_turso_database_url() -> str:
+    return _require_env("TURSO_DATABASE_URL")
 
 
-def get_supabase_publishable_key() -> str:
-    return _require_env("SUPABASE_PUBLISHABLE_KEY")
+def get_turso_auth_token() -> str:
+    return _require_env("TURSO_AUTH_TOKEN")
 
 
-def get_supabase_secret_key() -> str:
-    return _require_env("SUPABASE_SECRET_KEY")
-
-
-def get_supabase_jwks_url() -> str:
-    return _require_env("SUPABASE_JWKS_URL")
-
-
-def get_supabase_desktop_config() -> Dict[str, str]:
+def get_turso_config() -> Dict[str, str]:
     return {
-        "project_url": get_supabase_url(),
-        "publishable_key": get_supabase_publishable_key(),
-    }
-
-
-def get_supabase_admin_config() -> Dict[str, str]:
-    return {
-        "project_url": get_supabase_url(),
-        "publishable_key": get_supabase_publishable_key(),
-        "secret_key": get_supabase_secret_key(),
-        "jwks_url": get_supabase_jwks_url(),
+        "database_url": get_turso_database_url(),
+        "auth_token": get_turso_auth_token(),
     }

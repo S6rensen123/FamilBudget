@@ -7,12 +7,9 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from urllib import error as urllib_error
-from urllib import request as urllib_request
-
 import bcrypt
 from dotenv import load_dotenv
-from config import get_supabase_desktop_config
+from config import get_turso_config
 
 load_dotenv()
 
@@ -112,110 +109,112 @@ class SQLiteProvider(DatabaseProvider):
             raise RuntimeError(f"SQLite has_column error: {exc}") from exc
 
 
-class SupabaseProvider(DatabaseProvider):
-    def __init__(self, project_url: str = "", publishable_key: str = "", api_key: str = "") -> None:
-        resolved_key = publishable_key or api_key
-        if not project_url:
-            raise RuntimeError("Supabase konfiguration mangler SUPABASE_URL.")
-        if not resolved_key:
-            raise RuntimeError("Supabase konfiguration mangler SUPABASE_PUBLISHABLE_KEY.")
-        self.project_url = project_url
-        self.publishable_key = resolved_key
-        self.connected = False
+class TursoProvider(DatabaseProvider):
+    def __init__(self, database_url: str = "", auth_token: str = "") -> None:
+        if not database_url:
+            raise RuntimeError("Turso konfiguration mangler TURSO_DATABASE_URL.")
+        if not auth_token:
+            raise RuntimeError("Turso konfiguration mangler TURSO_AUTH_TOKEN.")
+        import libsql_client
 
-    def _unsupported(self) -> None:
-        raise RuntimeError("Supabase support is not configured in this build.")
+        self.database_url = database_url
+        self.auth_token = auth_token
+        self.client = libsql_client.create_client_sync(database_url, auth_token=auth_token)
+        self._last_rows: List[Dict[str, Any]] = []
+        self._last_row_index = 0
+        self._last_insert_rowid = 0
 
     def execute(self, query: str, params: Tuple[Any, ...] = ()) -> Any:
-        self._unsupported()
+        try:
+            result = self.client.execute(query, params)
+        except Exception as exc:
+            raise RuntimeError(f"Turso execute error: {exc}\nQuery: {query}\nParams: {params}") from exc
+        self._last_rows = []
+        self._last_row_index = 0
+        for row in result.rows:
+            if hasattr(row, "asdict"):
+                self._last_rows.append(dict(row.asdict()))
+            else:
+                self._last_rows.append(dict(row))
+        self._last_insert_rowid = int(result.last_insert_rowid or 0)
+        return result
 
     def fetchone(self) -> Optional[Any]:
-        self._unsupported()
+        if self._last_row_index >= len(self._last_rows):
+            return None
+        row = self._last_rows[self._last_row_index]
+        self._last_row_index += 1
+        return row
 
     def fetchall(self) -> List[Any]:
-        self._unsupported()
+        if self._last_row_index >= len(self._last_rows):
+            return []
+        rows = self._last_rows[self._last_row_index :]
+        self._last_row_index = len(self._last_rows)
+        return rows
 
     def commit(self) -> None:
-        self._unsupported()
+        return None
 
     def close(self) -> None:
-        self._unsupported()
+        self.client.close()
 
     def lastrowid(self) -> int:
-        self._unsupported()
+        return self._last_insert_rowid
 
     def has_column(self, table: str, column: str) -> bool:
-        self._unsupported()
+        if not self.table_exists(table):
+            return False
+        self.execute(f"PRAGMA table_info({table})")
+        return any(str(row["name"]) == column for row in self.fetchall())
 
     def table_exists(self, table: str) -> bool:
-        self._unsupported()
+        self.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,))
+        return self.fetchone() is not None
 
 
-class SupabaseRestSyncTransport:
-    def __init__(self, project_url: str, secret_key: Optional[str] = None, access_key: Optional[str] = None) -> None:
-        self.project_url = project_url.rstrip("/")
-        self.secret_key = secret_key.strip() if secret_key else ""
-        self.access_key = access_key.strip() if access_key else ""
+class TursoSyncTransport:
+    def __init__(self, database_url: str, auth_token: str) -> None:
+        if not database_url:
+            raise RuntimeError("Turso sync transport mangler TURSO_DATABASE_URL.")
+        if not auth_token:
+            raise RuntimeError("Turso sync transport mangler TURSO_AUTH_TOKEN.")
+        self.provider = TursoProvider(database_url=database_url, auth_token=auth_token)
 
-    def _headers(self) -> Dict[str, str]:
-        key = self.secret_key or self.access_key
-        if not self.project_url or not key:
-            raise RuntimeError("Supabase sync transport mangler konfiguration.")
-        return {
-            "apikey": key,
-            "Authorization": "Bearer " + key,
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
+    def close(self) -> None:
+        self.provider.close()
 
     def sync_item(self, table_name: str, row_id: Optional[str], operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.project_url:
-            raise RuntimeError("Supabase URL mangler.")
-
         table = table_name.replace('"', "")
-        url = f"{self.project_url}/rest/v1/{table}"
-        headers = self._headers()
-
-        def request(method: str, request_url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-            print("[SYNC] URL:", request_url)
-            try:
-                data = None if body is None else json.dumps(body).encode("utf-8")
-                req = urllib_request.Request(request_url, data=data, headers=headers, method=method)
-                with urllib_request.urlopen(req, timeout=20) as response:
-                    response_body = response.read().decode("utf-8", errors="replace")
-                    print("[SYNC] Status:", response.status)
-                    print("[SYNC] Body:", response_body)
-                if not response_body.strip():
-                    return {}
-                parsed_body = json.loads(response_body)
-                if isinstance(parsed_body, list):
-                    return parsed_body[0] if parsed_body else {}
-                if isinstance(parsed_body, dict):
-                    return parsed_body
-                return {}
-            except urllib_error.HTTPError as exc:
-                response_text = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
-                print("[SYNC] Status:", exc.code)
-                print("[SYNC] Body:", response_text)
-                print("[SYNC ERROR]", str(exc))
-                raise RuntimeError(f"Supabase sync request failed for {table_name}: {exc.code} {exc.reason}") from exc
-            except urllib_error.URLError as exc:
-                print("[SYNC] Body:", "")
-                print("[SYNC ERROR]", str(exc))
-                raise RuntimeError(f"Supabase sync request failed for {table_name}: {exc.reason}") from exc
-
+        print("[SYNC] Target:", table)
         if operation == "insert":
-            return request("POST", f"{url}?select=id", payload)
-        elif operation == "update":
+            columns = list(payload.keys())
+            values = tuple(payload[column] for column in columns)
+            if columns:
+                placeholders = ", ".join("?" for _ in columns)
+                column_sql = ", ".join(columns)
+                self.provider.execute(
+                    f"INSERT INTO {table} ({column_sql}) VALUES ({placeholders})",
+                    values,
+                )
+            else:
+                self.provider.execute(f"INSERT INTO {table} DEFAULT VALUES")
+            return {"id": str(payload.get("id", row_id or self.provider.lastrowid()))}
+        if operation == "update":
             if row_id is None:
                 raise RuntimeError(f"Sync update mangler row_id for {table_name}.")
-            return request("PATCH", f"{url}?id=eq.{row_id}&select=id", payload)
-        elif operation == "delete":
+            update_columns = [column for column in payload.keys() if column != "id"]
+            if update_columns:
+                assignments = ", ".join(f"{column} = ?" for column in update_columns)
+                params = tuple(payload[column] for column in update_columns) + (row_id,)
+                self.provider.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", params)
+            return {"id": str(row_id)}
+        if operation == "delete":
             if row_id is None:
                 raise RuntimeError(f"Sync delete mangler row_id for {table_name}.")
-            return request("DELETE", f"{url}?id=eq.{row_id}&select=id")
-        else:
-            raise RuntimeError(f"Ukendt sync operation: {operation}")
+            self.provider.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+            return {"id": str(row_id)}
+        raise RuntimeError(f"Ukendt sync operation: {operation}")
 
 
 class DatabaseService:
@@ -248,7 +247,7 @@ class DatabaseService:
         "subscriptions": {"user_id": "users", "household_id": "households"},
         "savings_goals": {"user_id": "users", "household_id": "households"},
     }
-    SUPABASE_ALLOWED_COLUMNS = {
+    SYNC_ALLOWED_COLUMNS = {
         "users": {"id", "full_name", "email", "password_hash", "created_at", "last_login", "role", "avatar_url", "updated_at"},
         "sessions": {"id", "user_id", "token", "device_name", "platform", "refresh_token_hash", "created_at", "expires_at", "revoked_at"},
         "households": {"id", "name", "owner_id", "invite_code", "created_at", "updated_at"},
@@ -267,7 +266,7 @@ class DatabaseService:
     ) -> None:
         print("[ENV] Current working directory:", os.getcwd())
         print("[ENV] .env exists:", Path(".env").exists())
-        print("[ENV] SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
+        print("[ENV] TURSO_DATABASE_URL:", bool(os.getenv("TURSO_DATABASE_URL")))
         provider_config = provider_config or {}
         self.provider_name = provider_name
         self._last_uuid_migration_report: Dict[str, Any] = {
@@ -278,37 +277,29 @@ class DatabaseService:
         }
         if provider_name == "sqlite":
             self.provider = SQLiteProvider(database_path)
-        elif provider_name == "supabase":
+        elif provider_name == "turso":
             if not provider_config:
-                provider_config = get_supabase_desktop_config()
-            if "secret_key" in provider_config or "SUPABASE_SECRET_KEY" in provider_config:
-                raise RuntimeError(
-                    "Desktop app må ikke bruge SUPABASE_SECRET_KEY. Brug kun SUPABASE_URL og SUPABASE_PUBLISHABLE_KEY."
-                )
-            self.provider = SupabaseProvider(**provider_config)
+                provider_config = get_turso_config()
+            self.provider = TursoProvider(**provider_config)
         else:
             raise ValueError(f"Unsupported provider: {provider_name}")
 
-        supabase_url_loaded = bool(os.getenv("SUPABASE_URL", "").strip())
+        turso_url_loaded = bool(os.getenv("TURSO_DATABASE_URL", "").strip())
         current_provider = provider_name
         print("[DB] Provider:", current_provider)
-        print("[DB] Supabase URL loaded:", supabase_url_loaded)
+        print("[DB] Turso URL loaded:", turso_url_loaded)
         self._sync_transport = None
 
-        supabase_url = os.getenv("SUPABASE_URL", "").strip()
-        publishable_key = os.getenv("SUPABASE_PUBLISHABLE_KEY", "").strip()
-        allow_secret_sync = os.getenv("SUPABASE_SYNC_ALLOW_SECRET", "").strip() == "1"
-        secret_key = os.getenv("SUPABASE_SECRET_KEY", "").strip() if allow_secret_sync else ""
-        if supabase_url and publishable_key:
-            self._sync_transport = SupabaseRestSyncTransport(
-                supabase_url,
-                secret_key=secret_key,
-                access_key=publishable_key,
+        turso_database_url = os.getenv("TURSO_DATABASE_URL", "").strip()
+        turso_auth_token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+        if turso_database_url and turso_auth_token:
+            self._sync_transport = TursoSyncTransport(
+                turso_database_url,
+                turso_auth_token,
             )
         print("[DB] Sync transport enabled:", self._sync_transport is not None)
 
         self.init_db()
-        print("[SYNC] UUID mode enabled")
 
     def _now(self) -> str:
         return datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -580,9 +571,6 @@ class DatabaseService:
                 "orphaned_references": [],
                 "failed_mappings": [],
             }
-            if self.provider.table_exists("sync_id_map"):
-                self.provider.execute("DROP TABLE sync_id_map")
-                self.provider.commit()
             return
 
         id_maps: Dict[str, Dict[str, str]] = {table_name: {} for table_name in self.UUID_TABLES}
@@ -762,26 +750,12 @@ class DatabaseService:
             for table_name in self.UUID_TABLES + ("sync_queue",):
                 self.provider.execute(f"ALTER TABLE {table_name}{temp_suffix} RENAME TO {table_name}")
             self._store_id_migration_map(id_maps)
-            if self.provider.table_exists("sync_id_map"):
-                self.provider.execute("DROP TABLE sync_id_map")
             self.provider.commit()
         finally:
             self.provider.execute("PRAGMA foreign_keys = ON")
             self.provider.commit()
 
     def _ensure_schema_columns(self) -> None:
-        self.provider.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_id_map (
-                table_name TEXT NOT NULL,
-                local_id TEXT NOT NULL,
-                remote_uuid TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (table_name, local_id)
-            )
-            """
-        )
         self._ensure_column("users", "updated_at", "updated_at TEXT")
         self._ensure_column("sessions", "device_name", "device_name TEXT")
         self._ensure_column("sessions", "platform", "platform TEXT")
@@ -825,52 +799,21 @@ class DatabaseService:
             return {}
         return {key: row[key] for key in row.keys()}
 
-    def _get_sync_mapped_uuid(self, table_name: str, local_id: Optional[str]) -> str:
-        if local_id in (None, ""):
-            return ""
-        self.provider.execute(
-            "SELECT remote_uuid FROM sync_id_map WHERE table_name = ? AND local_id = ?",
-            (table_name, local_id),
-        )
-        row = self.provider.fetchone()
-        return str(row["remote_uuid"]) if row is not None else ""
-
-    def _set_sync_mapped_uuid(self, table_name: str, local_id: Optional[str], remote_uuid: Optional[str]) -> None:
-        if local_id in (None, "") or remote_uuid in (None, ""):
-            return
-        timestamp = self._now()
-        self.provider.execute(
-            """
-            INSERT INTO sync_id_map (table_name, local_id, remote_uuid, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(table_name, local_id)
-            DO UPDATE SET remote_uuid = excluded.remote_uuid, updated_at = excluded.updated_at
-            """,
-            (table_name, local_id, remote_uuid, timestamp, timestamp),
-        )
-        self.provider.commit()
-
-    def _resolve_remote_uuid(self, table_name: str, local_id: Optional[str]) -> Optional[str]:
-        if local_id in (None, ""):
-            return None
-        mapped_uuid = self._get_sync_mapped_uuid(table_name, local_id)
-        return mapped_uuid or local_id
-
-    def _normalize_supabase_value(self, column_name: str, value: Any) -> Any:
+    def _normalize_sync_value(self, column_name: str, value: Any) -> Any:
         if value in ("", None):
             return None if value == "" else value
         if column_name in {"read", "active"}:
             return bool(value)
         return value
 
-    def _build_supabase_sync_item(
+    def _build_sync_item(
         self,
         table_name: str,
         row_id: Optional[str],
         operation: str,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        allowed_columns = self.SUPABASE_ALLOWED_COLUMNS.get(table_name)
+        allowed_columns = self.SYNC_ALLOWED_COLUMNS.get(table_name)
         if allowed_columns is None:
             raise RuntimeError(f"Sync mapping mangler for tabel {table_name}")
 
@@ -878,24 +821,14 @@ class DatabaseService:
         for column_name, raw_value in payload.items():
             if column_name not in allowed_columns:
                 continue
-            normalized_value = self._normalize_supabase_value(column_name, raw_value)
-            if column_name in self.UUID_FOREIGN_KEYS.get(table_name, {}):
-                normalized_value = self._resolve_remote_uuid(
-                    self.UUID_FOREIGN_KEYS[table_name][column_name],
-                    str(normalized_value) if normalized_value is not None else None,
-                )
-            mapped_payload[column_name] = normalized_value
-
-        remote_row_id = self._resolve_remote_uuid(table_name, row_id)
-        if "id" in mapped_payload and remote_row_id:
-            mapped_payload["id"] = remote_row_id
+            mapped_payload[column_name] = self._normalize_sync_value(column_name, raw_value)
 
         print("[SYNC] Payload after mapping:", json.dumps(mapped_payload, ensure_ascii=True, default=str))
         return {
             "skip": False,
             "operation": operation,
             "payload": mapped_payload,
-            "remote_row_id": remote_row_id or "",
+            "remote_row_id": row_id or "",
         }
 
     def get_sync_status(self) -> Dict[str, Any]:
@@ -1063,7 +996,7 @@ class DatabaseService:
                 print("[SYNC] Table:", item["table_name"])
                 print("[SYNC] Row:", item["row_id"])
                 payload = json.loads(item["payload"])
-                sync_item = self._build_supabase_sync_item(
+                sync_item = self._build_sync_item(
                     table_name=item["table_name"],
                     row_id=item["row_id"],
                     operation=item["operation"],
@@ -1073,18 +1006,12 @@ class DatabaseService:
                     self.mark_sync_item_synced(int(item["id"]))
                     synced += 1
                     continue
-                response_payload = self._sync_transport.sync_item(
+                self._sync_transport.sync_item(
                     table_name=item["table_name"],
                     row_id=sync_item["remote_row_id"] or None,
                     operation=sync_item["operation"],
                     payload=sync_item["payload"],
                 )
-                local_row_id = str(item["row_id"]) if item["row_id"] not in (None, "") else str(payload.get("id", ""))
-                remote_uuid = ""
-                if isinstance(response_payload, dict):
-                    remote_uuid = str(response_payload.get("id", "") or "")
-                if local_row_id and remote_uuid:
-                    self._set_sync_mapped_uuid(str(item["table_name"]), local_row_id, remote_uuid)
                 self.mark_sync_item_synced(int(item["id"]))
                 synced += 1
                 last_synced_at = self._now()

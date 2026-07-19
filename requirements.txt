@@ -1,6 +1,6 @@
 bcrypt
 python-dotenv
-requests
+libsql-client
 black
 flake8
 pyinstaller
